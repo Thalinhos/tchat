@@ -2,6 +2,7 @@ import * as readline from "readline";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { spawn } from "child_process";
 
 const API_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL_DEFAULT = "z-ai/glm-4.5-air:free";
@@ -39,6 +40,38 @@ Para usar uma ferramenta, inclua a tag XML correspondente na sua resposta. Você
 ### Escrever/editar arquivo
 <write_file path="caminho/do/arquivo">conteúdo completo do arquivo aqui</write_file>
 
+
+### Execução de comandos pela ferramenta
+
+Esta aplicação pode executar comandos do sistema quando executada interativamente.
+
+Segurança: comandos só serão executados após confirmação explícita do usuário.
+
+**DOIS TIPOS DE TAGS XML para comandos:**
+
+**TIPO 1: <run_command>comando</run_command>** — Síncrono APENAS
+- Bloqueia até conclusão
+- APENAS para: npm install, npm ci, npm run build, npm test, npm run lint
+- NUNCA para servidores ou processos contínuos
+- Exemplo CORRETO: <run_command>npm install</run_command>
+- Exemplo ERRADO: <run_command>npm start</run_command> ❌
+
+**TIPO 2: <run_command_bg>comando</run_command_bg>** — Background/Long-running
+- Inicia processo gerenciado, retorna imediatamente
+- Para TODOS os servidores e processos contínuos:
+  * npm start
+  * npm run dev
+  * npm run watch
+  * npm run server
+  * nodemon
+  * qualquer coisa que não termina sozinha
+- Exemplo CORRETO: <run_command_bg>npm start</run_command_bg>
+- Exemplo CORRETO: <run_command_bg>npm run dev</run_command_bg>
+- Exemplo ERRADO: <run_command>npm start</run_command> ❌
+
+**REGRA CRÍTICA**: npm start e npm run dev DEVEM SEMPRE ser <run_command_bg>, NUNCA <run_command>.
+Se o usuário pedir para "rodar o projeto", "iniciar servidor", "rodar dev", retorne <run_command_bg>.
+
 ## Regras
 - Sempre use <read_file> para ler arquivos antes de sugerir edições
 - Ao editar, escreva o arquivo COMPLETO com <write_file>, nunca use placeholders
@@ -53,6 +86,79 @@ const rl = readline.createInterface({
 });
 
 const fsp = fs.promises;
+
+// --- Process management ---
+type ManagedProc = {
+  name: string;
+  cmd: string;
+  cwd?: string;
+  proc: ReturnType<typeof spawn>;
+};
+
+const managedProcesses = new Map<string, ManagedProc>();
+let activeProcessName: string | null = null; // Rastreia processo ativo (último iniciado)
+
+function runCommand(cmd: string, cwd?: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ps = spawn(cmd, { shell: true, cwd, stdio: "inherit" });
+    ps.on("error", (err) => reject(err));
+    ps.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`exit ${code}`));
+    });
+  });
+}
+
+function startManagedProcess(name: string, cmd: string, cwd?: string): string {
+  if (managedProcesses.has(name)) return `[ERRO: processo '${name}' já existe]`;
+  try {
+    const ps = spawn(cmd, { shell: true, cwd, stdio: "inherit" });
+    const m: ManagedProc = { name, cmd, cwd, proc: ps };
+    managedProcesses.set(name, m);
+    activeProcessName = name; // Define como ativo
+    ps.on("close", (code) => {
+      managedProcesses.delete(name);
+      // Limpa se era o ativo
+      if (activeProcessName === name) activeProcessName = null;
+      try {
+        process.stdout.write(`\n[process ${name} exited ${code}]\n`);
+      } catch {}
+    });
+    return `[OK: processo '${name}' iniciado]`;
+  } catch (e: any) {
+    return `[ERRO ao iniciar '${name}': ${e.message}]`;
+  }
+}
+
+async function stopManagedProcess(nameOrActive?: string): Promise<string> {
+  // Se não passou nome, usa o ativo
+  let name = nameOrActive || activeProcessName;
+  if (!name) return `[ERRO: nenhum processo ativo ou especificado]`;
+  
+  const m = managedProcesses.get(name);
+  if (!m) return `[ERRO: processo '${name}' não encontrado]`;
+  try {
+    // try graceful
+    m.proc.kill();
+    // wait small time for exit
+    await new Promise((res) => setTimeout(res, 800));
+    if (managedProcesses.has(name)) {
+      try {
+        m.proc.kill("SIGKILL");
+      } catch {}
+    }
+    return `[OK: processo '${name}' finalizado]`;
+  } catch (e: any) {
+    return `[ERRO ao parar '${name}': ${e.message}]`;
+  }
+}
+
+function listManaged(): string {
+  if (managedProcesses.size === 0) return "[Nenhum processo gerenciado ativo]";
+  return Array.from(managedProcesses.values())
+    .map((m) => `- ${m.name}: ${m.cmd} ${m.cwd ? `(${m.cwd})` : ""}`)
+    .join("\n");
+}
 
 const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
   { role: "system", content: SYSTEM_PROMPT },
@@ -352,10 +458,11 @@ async function searchFilesAsync(pattern: string): Promise<string> {
 // --- Parse tool calls from AI response ---
 
 interface ToolCall {
-  type: "read_file" | "write_file" | "list_dir" | "search_files";
+  type: "read_file" | "write_file" | "list_dir" | "search_files" | "run_command" | "run_command_bg";
   path?: string;
   content?: string;
   pattern?: string;
+  command?: string;
   raw: string;
 }
 
@@ -392,13 +499,99 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
   }
   cleaned = cleaned.replace(searchRegex, "");
 
-  return { calls, cleaned: cleaned.trim() };
+  // Parse <run_command>comando</run_command>
+  const runCmdRegex = /<run_command>([\s\S]*?)<\/run_command>/g;
+  while ((match = runCmdRegex.exec(text)) !== null) {
+    calls.push({ type: "run_command", command: match[1].trim(), raw: match[0] });
+  }
+  cleaned = cleaned.replace(runCmdRegex, "");
+
+  // Parse <run_command_bg>comando</run_command_bg>
+  const runCmdBgRegex = /<run_command_bg>([\s\S]*?)<\/run_command_bg>/g;
+  while ((match = runCmdBgRegex.exec(text)) !== null) {
+    calls.push({ type: "run_command_bg", command: match[1].trim(), raw: match[0] });
+  }
+  cleaned = cleaned.replace(runCmdBgRegex, "");
+
+  // Auto-correct: se <run_command> contém comandos que devem ser background, converter
+  const bgPatterns = ["npm start", "npm run dev", "npm run watch", "npm run server", "nodemon", "bun run dev"];
+  const normalizedCalls = calls.map((call) => {
+    if (call.type === "run_command") {
+      const cmd = call.command || "";
+      for (const pattern of bgPatterns) {
+        if (cmd.includes(pattern)) {
+          console.warn(`⚠️  Auto-correção: "${cmd}" deve ser background, convertendo para <run_command_bg>`);
+          return { ...call, type: "run_command_bg" };
+        }
+      }
+    }
+    return call;
+  });
+
+  return { calls: normalizedCalls, cleaned: cleaned.trim() };
 }
 
 async function executeToolCalls(calls: ToolCall[]): Promise<string> {
   const results: string[] = [];
 
-  for (const call of calls) {
+  // Separar comandos do resto
+  const runCommands = calls.filter((c) => c.type === "run_command");
+  const runCommandsBg = calls.filter((c) => c.type === "run_command_bg");
+  const otherCalls = calls.filter((c) => c.type !== "run_command" && c.type !== "run_command_bg");
+
+  // Processar run_command e run_command_bg juntos com uma única confirmação
+  if (runCommands.length > 0 || runCommandsBg.length > 0) {
+    const totalCmds = runCommands.length + runCommandsBg.length;
+    console.log(`\n[IA quer executar ${totalCmds} comando(s)]:`);
+    for (let i = 0; i < runCommands.length; i++) {
+      console.log(`  ${i + 1}. ${runCommands[i].command} (síncrono)`);
+    }
+    for (let i = 0; i < runCommandsBg.length; i++) {
+      console.log(`  ${runCommands.length + i + 1}. ${runCommandsBg[i].command} (background)`);
+    }
+    const ok = (await ask(`Executar na sequência? (y/n): `)).trim().toLowerCase();
+    if (ok === "y" || ok === "yes") {
+      let cmdIndex = 1;
+      
+      // Executar run_command (síncrono)
+      for (let i = 0; i < runCommands.length; i++) {
+        const cmd = runCommands[i].command!;
+        console.log(`\n[${cmdIndex}/${totalCmds}] Executando (síncrono): ${cmd}`);
+        try {
+          await runCommand(cmd, process.cwd());
+          console.log(`✓ Comando finalizado com sucesso.`);
+          results.push(`[run_command ${i + 1} concluído: ${cmd}]`);
+        } catch (e: any) {
+          console.error(`✗ Erro: ${e.message}`);
+          results.push(`[run_command ${i + 1} falhou: ${cmd} - ${e.message}]`);
+        }
+        cmdIndex++;
+      }
+
+      // Executar run_command_bg (background)
+      for (let i = 0; i < runCommandsBg.length; i++) {
+        const cmd = runCommandsBg[i].command!;
+        console.log(`\n[${cmdIndex}/${totalCmds}] Iniciando em background: ${cmd}`);
+        const procName = `bg-${Date.now()}-${i}`;
+        const msg = startManagedProcess(procName, cmd, process.cwd());
+        console.log(`${msg}`);
+        console.log(`Processo: ${procName}. Use /ps para listar, /kill ou /stop para parar.`);
+        results.push(`[run_command_bg ${i + 1} iniciado: ${cmd} (${procName})]`);
+        cmdIndex++;
+      }
+    } else {
+      console.log("Comandos cancelados pelo usuário.\n");
+      for (let i = 0; i < runCommands.length; i++) {
+        results.push(`[run_command ${i + 1} cancelado: ${runCommands[i].command}]`);
+      }
+      for (let i = 0; i < runCommandsBg.length; i++) {
+        results.push(`[run_command_bg ${i + 1} cancelado: ${runCommandsBg[i].command}]`);
+      }
+    }
+  }
+
+  // Processar outros tool calls
+  for (const call of otherCalls) {
     switch (call.type) {
       case "read_file": {
         const content = await readFileAsync(call.path!);
@@ -473,13 +666,16 @@ function printHelp(modelUsed: string) {
   console.log("  - O assistente pode ler, buscar e editar seus arquivos");
   console.log("  - Use @arquivo para forçar anexo de um arquivo");
   console.log("\nComandos:");
-  console.log("  /ls [dir]           - lista diretório");
-  console.log("  /cd <dir>           - muda diretório");
-  console.log("  /model [nome]       - mostra/troca modelo (salvo em settings do usuário)");
-  console.log("  /api_key [chave]    - define API key para esta sessão (não salva automaticamente)");
-  console.log("  /clear              - limpa histórico");
-  console.log("  /h, /help           - mostra esta ajuda");
-  console.log("  sair                - encerra\n");
+  console.log("  /ls [dir]              - lista diretório");
+  console.log("  /cd <dir>              - muda diretório");
+  console.log("  /model [nome]          - mostra/troca modelo (salvo em settings do usuário)");
+  console.log("  /api_key [chave]       - define API key para esta sessão");
+  console.log("  /clear                 - limpa histórico");
+  console.log("  /stop [nome]           - para processo (sem nome = para ativo)");
+  console.log("  /kill [nome]           - mata processo (sem confirmação, sem nome = ativo)");
+  console.log("  /ps                    - lista processos gerenciados");
+  console.log("  /h, /help              - mostra esta ajuda");
+  console.log("  sair                   - encerra\n");
 }
 
 // --- Auto-attach files mentioned by user ---
@@ -722,6 +918,86 @@ async function main() {
         saveSettings({ apiKey: finalApiKey });
       } catch {}
       console.log("API key atualizada e salva nas settings do usuário.\n");
+      continue;
+    }
+
+    // /run command: run one-off shell command after explicit consent
+    if (input.startsWith("/run ")) {
+      const cmd = input.slice(5).trim();
+      if (!cmd) {
+        console.log("Uso: /run <comando>\n");
+        continue;
+      }
+      const ok = (await ask(`Executar comando (projeto ${process.cwd()}): ${cmd} ? (y/n): `)).trim().toLowerCase();
+      if (ok !== "y" && ok !== "yes") {
+        console.log("Cancelado pelo usuário.\n");
+        continue;
+      }
+      try {
+        await runCommand(cmd, process.cwd());
+        console.log(`Comando '${cmd}' finalizado.`);
+      } catch (e: any) {
+        console.error(`Erro: ${e.message}`);
+      }
+      continue;
+    }
+
+    // /start <nome> <comando> - inicia processo gerenciado
+    if (input.startsWith("/start ")) {
+      const rest = input.slice(7).trim();
+      const parts = rest.split(" ");
+      if (parts.length < 2) {
+        console.log("Uso: /start <nome> <comando>");
+        continue;
+      }
+      const name = parts.shift()!;
+      const cmd = parts.join(" ");
+      const ok = (await ask(`Iniciar processo '${name}': ${cmd} ? (y/n): `)).trim().toLowerCase();
+      if (ok !== "y" && ok !== "yes") {
+        console.log("Cancelado pelo usuário.\n");
+        continue;
+      }
+      console.log(startManagedProcess(name, cmd, process.cwd()));
+      continue;
+    }
+
+    // /stop [nome] - para processo gerenciado (sem nome = para ativo)
+    if (input === "/stop" || input.startsWith("/stop ")) {
+      const name = input.slice(5).trim();
+      const targetName = name || activeProcessName;
+      if (!targetName) {
+        console.log("[Nenhum processo ativo. Use /ps para listar.]\n");
+        continue;
+      }
+      const ok = (await ask(`Parar processo '${targetName}' ? (y/n): `)).trim().toLowerCase();
+      if (ok !== "y" && ok !== "yes") {
+        console.log("Cancelado pelo usuário.\n");
+        continue;
+      }
+      console.log(await stopManagedProcess(targetName));
+      if (targetName === activeProcessName) activeProcessName = null;
+      continue;
+    }
+
+    // /kill [nome] - alias para /stop (mata ativo se nenhum nome, sem confirmação)
+    if (input === "/kill" || input.startsWith("/kill ")) {
+      const name = input.slice(5).trim();
+      const targetName = name || activeProcessName;
+      if (!targetName) {
+        console.log("[Nenhum processo ativo. Use /ps para listar.]\n");
+        continue;
+      }
+      console.log(await stopManagedProcess(targetName));
+      if (targetName === activeProcessName) activeProcessName = null;
+      continue;
+    }
+
+    // /ps - lista processos gerenciados
+    if (input === "/ps") {
+      if (activeProcessName) {
+        console.log(`[Processo ativo: ${activeProcessName}]\n`);
+      }
+      console.log(listManaged() + "\n");
       continue;
     }
 
