@@ -4,81 +4,132 @@ import * as path from "path";
 import * as os from "os";
 import { spawn } from "child_process";
 
-const API_URL = "https://openrouter.ai/api/v1/chat/completions";
+// --- Error handling ---
+class AppError extends Error {
+  constructor(
+    message: string,
+    public code: string = "INTERNAL_ERROR",
+    public statusCode: number = 500
+  ) {
+    super(message);
+    this.name = "AppError";
+  }
+}
+
+class APIError extends AppError {
+  constructor(message: string, statusCode: number) {
+    super(message, "API_ERROR", statusCode);
+    this.name = "APIError";
+  }
+}
+
+class ValidationError extends AppError {
+  constructor(message: string) {
+    super(message, "VALIDATION_ERROR", 400);
+    this.name = "ValidationError";
+  }
+}
+
+class CommandExecutionError extends AppError {
+  constructor(message: string, public exitCode?: number) {
+    super(message, "COMMAND_EXECUTION_ERROR", 500);
+    this.name = "CommandExecutionError";
+  }
+}
+
+// Safe command validator
+const DANGEROUS_PATTERNS = [
+  /^\s*(rm|rmdir|del|deltree|rd|unlink)\s+/i,  // delete commands
+  /^\s*format\s+/i,                              // format drives
+  /^\s*wipe\s+/i,                                // secure wipe
+  /^\s*shutdown\s+/i,                            // shutdown
+  /&&\s*(rm|del|format|wipe)/i,                  // chained dangerous
+  /\|\s*(rm|del|format|wipe)/i,                 // piped dangerous
+  />.*\s+(\\\|\/)\\\.*$/i,                       // redirect to system dirs
+];
+
+function validateShellCommand(cmd: string): { safe: boolean; reason?: string } {
+  if (!cmd || !cmd.trim()) return { safe: false, reason: "Comando vazio" };
+  
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(cmd)) {
+      return { safe: false, reason: `Comando bloqueado por segurança: padrão perigoso detectado` };
+    }
+  }
+  return { safe: true };
+}
+
+const API_URL_DEFAULTS = {
+  openrouter: "https://openrouter.ai/api/v1/chat/completions",
+  openai: "https://api.openai.com/v1/chat/completions",
+  anthropic: "https://api.anthropic.com/v1/messages",
+  groq: "https://api.groq.com/openai/v1/chat/completions",
+  deepseek: "https://api.deepseek.com/v1/chat/completions",
+};
+
 const MODEL_DEFAULT = "z-ai/glm-4.5-air:free";
+const FALLBACK_MODEL_DEFAULT = "openai/gpt-oss-120b:free";
 const DEFAULT_MODELS = ["openai/gpt-oss-120b:free", "z-ai/glm-4.5-air:free"];
 const ALLOWED_MODELS = [
-  "openai/gpt-oss-120b:free",
   "z-ai/glm-4.5-air:free",
+  "openai/gpt-oss-120b:free",
   "openai/gpt-5.4-nano",
   "openai/gpt-5.3-codex",
-  "anthropic/claude-3-haiku",
   "anthropic/claude-haiku-4.5",
   "anthropic/claude-sonnet-4.6",
   "anthropic/claude-opus-4.7",
   "qwen/qwen3.6-plus",
 ];
 const MAX_TOOL_ROUNDS = 10;
+const MAX_RETRIES = 2; // Número máximo de retries com fallback
 
-const SYSTEM_PROMPT = `Você é um assistente de programação com acesso a ferramentas para ler e editar arquivos do projeto do usuário.
+// Caveman mode instructions
+const CAVEMAN_INSTRUCTIONS = {
+  lite: `
+## Caveman Mode: LITE
+Respond professional but drop filler. Keep grammar. No fluff.
+- Drop: really, just, basically, actually, simply
+- Keep: full sentences, articles, proper structure
+- Code/commits: normal. Off: "stop caveman" / "normal mode"`,
+  
+  full: `
+## Caveman Mode: FULL (Default)
+Terse like caveman. Technical substance exact. Only fluff die.
+- Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course)
+- Fragments OK. Short synonyms (big not extensive, fix not "implement a solution for")
+- Technical terms exact. Code unchanged.
+- Pattern: [thing] [action] [reason]. [next step].
+- Example NO: "Sure! I'd be happy to help. The issue is likely..."
+- Example YES: "Bug in auth. Token check use < not <=. Fix:"
+- Code/commits/PRs: normal. Off: "stop caveman" / "normal mode"`,
+  
+  ultra: `
+## Caveman Mode: ULTRA
+Maximum compression. Telegraphic. Abbreviate everything.
+- Use: DB, auth, config, req, res, fn, impl (abbreviations OK)
+- Drop: conjunctions (and/but/or → use arrow X → Y)
+- Strip articles completely
+- One word when one word enough
+- Example: "Inline obj prop → new ref → re-render. \`useMemo\`."
+- Code/commits/PRs: normal. Off: "stop caveman" / "normal mode"`,
+};
+
+type CavemanLevel = "off" | "lite" | "full" | "ultra";
+
+const SYSTEM_PROMPT = `Você é um assistente de programação com acesso a ferramentas para ler e editar arquivos.
 
 Diretório de trabalho: ${process.cwd()}
 
-## Ferramentas disponíveis
+## MODO PLANEJAMENTO OBRIGATÓRIO
+Antes de executar tarefas complexas:
+1. Escreva um plano usando <plan>...</plan>
+2. Aguarde aprovação do usuário (y/yes/Enter)
+3. Execute ferramentas apenas após aprovação
 
-Para usar uma ferramenta, inclua a tag XML correspondente na sua resposta. Você pode combinar texto normal com chamadas de ferramentas. Pode fazer múltiplas chamadas em uma única resposta.
-
-### Ler arquivo
-<read_file>caminho/do/arquivo</read_file>
-
-### Listar diretório
-<list_dir>caminho/do/diretorio</list_dir>
-
-### Buscar arquivos por nome
-<search_files>padrão de busca</search_files>
-
-### Escrever/editar arquivo
-<write_file path="caminho/do/arquivo">conteúdo completo do arquivo aqui</write_file>
-
-
-### Execução de comandos pela ferramenta
-
-Esta aplicação pode executar comandos do sistema quando executada interativamente.
-
-Segurança: comandos só serão executados após confirmação explícita do usuário.
-
-**DOIS TIPOS DE TAGS XML para comandos:**
-
-**TIPO 1: <run_command>comando</run_command>** — Síncrono APENAS
-- Bloqueia até conclusão
-- APENAS para: npm install, npm ci, npm run build, npm test, npm run lint
-- NUNCA para servidores ou processos contínuos
-- Exemplo CORRETO: <run_command>npm install</run_command>
-- Exemplo ERRADO: <run_command>npm start</run_command> ❌
-
-**TIPO 2: <run_command_bg>comando</run_command_bg>** — Background/Long-running
-- Inicia processo gerenciado, retorna imediatamente
-- Para TODOS os servidores e processos contínuos:
-  * npm start
-  * npm run dev
-  * npm run watch
-  * npm run server
-  * nodemon
-  * qualquer coisa que não termina sozinha
-- Exemplo CORRETO: <run_command_bg>npm start</run_command_bg>
-- Exemplo CORRETO: <run_command_bg>npm run dev</run_command_bg>
-- Exemplo ERRADO: <run_command>npm start</run_command> ❌
-
-**REGRA CRÍTICA**: npm start e npm run dev DEVEM SEMPRE ser <run_command_bg>, NUNCA <run_command>.
-Se o usuário pedir para "rodar o projeto", "iniciar servidor", "rodar dev", retorne <run_command_bg>.
-
-## Regras
-- Sempre use <read_file> para ler arquivos antes de sugerir edições
-- Ao editar, escreva o arquivo COMPLETO com <write_file>, nunca use placeholders
-- Use <search_files> quando não souber o caminho exato de um arquivo
-- Use <list_dir> para explorar a estrutura do projeto
-- Depois de editar, confirme o que foi feito
-- Responda sempre em português`;
+## Ferramentas: <read_file>path</read_file>, <list_dir>path</list_dir>, <search_files>pattern</search_files>, <write_file path="p">content</write_file>
+Para comandos: <run_command>cmd</run_command> (sync) ou <run_command_bg>cmd</run_command_bg> (bg)
+REGRA: npm start e npm run dev = <run_command_bg>!
+Responda em português`;
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -100,12 +151,16 @@ let activeProcessName: string | null = null; // Rastreia processo ativo (último
 
 function runCommand(cmd: string, cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const ps = spawn(cmd, { shell: true, cwd, stdio: "inherit" });
-    ps.on("error", (err) => reject(err));
-    ps.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`exit ${code}`));
-    });
+    try {
+      const ps = spawn(cmd, { shell: true, cwd, stdio: "inherit" });
+      ps.on("error", (err) => reject(new CommandExecutionError(`Erro ao executar: ${(err as any).message}`)));
+      ps.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new CommandExecutionError(`Comando falhou com exit code ${code}`, code ?? undefined));
+      });
+    } catch (err: any) {
+      reject(new CommandExecutionError(`Erro ao iniciar processo: ${err.message}`));
+    }
   });
 }
 
@@ -167,9 +222,34 @@ const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
 // session-wide choices
 let sessionAcceptAll = false;
 let sessionRejectAll = false;
+let cavemanMode: CavemanLevel = "off";
+let apiUrl = API_URL_DEFAULTS.openrouter;
 
-function ask(prompt: string): Promise<string> {
-  return new Promise((resolve) => rl.question(prompt, resolve));
+function ask(prompt: string, acceptEmptyAsYes: boolean = false): Promise<string> {
+  return new Promise((resolve) => {
+    rl.question(prompt, (answer) => {
+      // Se acceptEmptyAsYes está ativo e resposta vazia, retorna "y"
+      if (acceptEmptyAsYes && answer.trim() === "") {
+        resolve("y");
+      } else {
+        resolve(answer);
+      }
+    });
+  });
+}
+
+function updateSystemPromptWithCaveman(mode: CavemanLevel): void {
+  let systemContent = SYSTEM_PROMPT;
+  
+  // Remove existing caveman instruction if present
+  systemContent = systemContent.replace(/## Caveman Mode:.*?(?=\n---|\n\n|$)/s, "").trim();
+  
+  // Add new caveman instruction if not "off"
+  if (mode !== "off" && CAVEMAN_INSTRUCTIONS[mode]) {
+    systemContent += "\n\n" + CAVEMAN_INSTRUCTIONS[mode];
+  }
+  
+  messages[0] = { role: "system", content: systemContent };
 }
 
 // CLI spinner helper
@@ -231,8 +311,8 @@ function coloredDiff(oldStr: string, newStr: string): string {
   const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
-      if (oldLines[i] === newLines[j]) dp[i][j] = 1 + dp[i + 1][j + 1];
-      else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      if (oldLines[i] === newLines[j]) dp[i]![j] = 1 + (dp[i + 1]?.[j + 1] ?? 0);
+      else dp[i]![j] = Math.max(dp[i + 1]?.[j] ?? 0, dp[i]?.[j + 1] ?? 0);
     }
   }
 
@@ -242,14 +322,14 @@ function coloredDiff(oldStr: string, newStr: string): string {
     j = 0;
   while (i < n || j < m) {
     if (i < n && j < m && oldLines[i] === newLines[j]) {
-      out.push({ op: " ", line: oldLines[i] });
+      out.push({ op: " ", line: oldLines[i]! });
       i++;
       j++;
-    } else if (j < m && (i === n || dp[i][j + 1] >= dp[i + 1][j])) {
-      out.push({ op: "+", line: newLines[j] });
+    } else if (j < m && (i === n || (dp[i]?.[j + 1] ?? 0) >= (dp[i + 1]?.[j] ?? 0))) {
+      out.push({ op: "+", line: newLines[j]! });
       j++;
     } else if (i < n) {
-      out.push({ op: "-", line: oldLines[i] });
+      out.push({ op: "-", line: oldLines[i]! });
       i++;
     }
   }
@@ -470,6 +550,9 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
   const calls: ToolCall[] = [];
   let cleaned = text;
 
+  // Remove <plan>...</plan> tags (não são tool calls)
+  cleaned = cleaned.replace(/<plan>[\s\S]*?<\/plan>/g, "").trim();
+
   // Parse <write_file path="...">content</write_file>
   const writeRegex = /<write_file\s+path="([^"]+)">([\s\S]*?)<\/write_file>/g;
   let match: RegExpExecArray | null;
@@ -481,35 +564,35 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
   // Parse <read_file>path</read_file>
   const readRegex = /<read_file>([\s\S]*?)<\/read_file>/g;
   while ((match = readRegex.exec(text)) !== null) {
-    calls.push({ type: "read_file", path: match[1].trim(), raw: match[0] });
+    if (match[1]) calls.push({ type: "read_file", path: match[1].trim(), raw: match[0] });
   }
   cleaned = cleaned.replace(readRegex, "");
 
   // Parse <list_dir>path</list_dir>
   const listRegex = /<list_dir>([\s\S]*?)<\/list_dir>/g;
   while ((match = listRegex.exec(text)) !== null) {
-    calls.push({ type: "list_dir", path: match[1].trim(), raw: match[0] });
+    if (match[1]) calls.push({ type: "list_dir", path: match[1].trim(), raw: match[0] });
   }
   cleaned = cleaned.replace(listRegex, "");
 
   // Parse <search_files>pattern</search_files>
   const searchRegex = /<search_files>([\s\S]*?)<\/search_files>/g;
   while ((match = searchRegex.exec(text)) !== null) {
-    calls.push({ type: "search_files", pattern: match[1].trim(), raw: match[0] });
+    if (match[1]) calls.push({ type: "search_files", pattern: match[1].trim(), raw: match[0] });
   }
   cleaned = cleaned.replace(searchRegex, "");
 
   // Parse <run_command>comando</run_command>
   const runCmdRegex = /<run_command>([\s\S]*?)<\/run_command>/g;
   while ((match = runCmdRegex.exec(text)) !== null) {
-    calls.push({ type: "run_command", command: match[1].trim(), raw: match[0] });
+    if (match[1]) calls.push({ type: "run_command", command: match[1].trim(), raw: match[0] });
   }
   cleaned = cleaned.replace(runCmdRegex, "");
 
   // Parse <run_command_bg>comando</run_command_bg>
   const runCmdBgRegex = /<run_command_bg>([\s\S]*?)<\/run_command_bg>/g;
   while ((match = runCmdBgRegex.exec(text)) !== null) {
-    calls.push({ type: "run_command_bg", command: match[1].trim(), raw: match[0] });
+    if (match[1]) calls.push({ type: "run_command_bg", command: match[1].trim(), raw: match[0] });
   }
   cleaned = cleaned.replace(runCmdBgRegex, "");
 
@@ -521,12 +604,12 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
       for (const pattern of bgPatterns) {
         if (cmd.includes(pattern)) {
           console.warn(`⚠️  Auto-correção: "${cmd}" deve ser background, convertendo para <run_command_bg>`);
-          return { ...call, type: "run_command_bg" };
+          return { ...call, type: "run_command_bg" as const };
         }
       }
     }
     return call;
-  });
+  }) as ToolCall[];
 
   return { calls: normalizedCalls, cleaned: cleaned.trim() };
 }
@@ -544,10 +627,10 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
     const totalCmds = runCommands.length + runCommandsBg.length;
     console.log(`\n[IA quer executar ${totalCmds} comando(s)]:`);
     for (let i = 0; i < runCommands.length; i++) {
-      console.log(`  ${i + 1}. ${runCommands[i].command} (síncrono)`);
+      console.log(`  ${i + 1}. ${runCommands[i]?.command} (síncrono)`);
     }
     for (let i = 0; i < runCommandsBg.length; i++) {
-      console.log(`  ${runCommands.length + i + 1}. ${runCommandsBg[i].command} (background)`);
+      console.log(`  ${runCommands.length + i + 1}. ${runCommandsBg[i]?.command} (background)`);
     }
     const ok = (await ask(`Executar na sequência? (y/n): `)).trim().toLowerCase();
     if (ok === "y" || ok === "yes") {
@@ -555,7 +638,7 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
       
       // Executar run_command (síncrono)
       for (let i = 0; i < runCommands.length; i++) {
-        const cmd = runCommands[i].command!;
+        const cmd = runCommands[i]?.command ?? "";
         console.log(`\n[${cmdIndex}/${totalCmds}] Executando (síncrono): ${cmd}`);
         try {
           await runCommand(cmd, process.cwd());
@@ -570,7 +653,7 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
 
       // Executar run_command_bg (background)
       for (let i = 0; i < runCommandsBg.length; i++) {
-        const cmd = runCommandsBg[i].command!;
+        const cmd = runCommandsBg[i]?.command ?? "";
         console.log(`\n[${cmdIndex}/${totalCmds}] Iniciando em background: ${cmd}`);
         const procName = `bg-${Date.now()}-${i}`;
         const msg = startManagedProcess(procName, cmd, process.cwd());
@@ -582,10 +665,10 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
     } else {
       console.log("Comandos cancelados pelo usuário.\n");
       for (let i = 0; i < runCommands.length; i++) {
-        results.push(`[run_command ${i + 1} cancelado: ${runCommands[i].command}]`);
+        results.push(`[run_command ${i + 1} cancelado: ${runCommands[i]?.command}]`);
       }
       for (let i = 0; i < runCommandsBg.length; i++) {
-        results.push(`[run_command_bg ${i + 1} cancelado: ${runCommandsBg[i].command}]`);
+        results.push(`[run_command_bg ${i + 1} cancelado: ${runCommandsBg[i]?.command}]`);
       }
     }
   }
@@ -658,8 +741,11 @@ function saveSettings(updates: Record<string, any>): void {
   }
 }
 
-function printHelp(modelUsed: string) {
+function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log(`\nModelo: ${modelUsed}`);
+  console.log(`Fallback: ${fallbackModel || "nenhum"}`);
+  console.log(`Caveman: ${cavemanMode !== "off" ? cavemanMode.toUpperCase() : "off"}`);
+  console.log(`URL API: ${apiUrl}`);
   console.log(`Diretório: ${process.cwd()}`);
   console.log("\nRecursos:");
   console.log("  - Arquivos mencionados são anexados automaticamente");
@@ -669,9 +755,13 @@ function printHelp(modelUsed: string) {
   console.log("  /ls [dir]              - lista diretório");
   console.log("  /cd <dir>              - muda diretório");
   console.log("  /model [nome]          - mostra/troca modelo (salvo em settings do usuário)");
+  console.log("  /model add <nome>      - adiciona modelo aos permitidos (para testar)");
+  console.log("  /model rm <nome>       - remove modelo adicionado");
+  console.log("  /fallback [nome]       - mostra/troca modelo de fallback (usado se principal falhar)");
+  console.log("  /caveman [lite|full|ultra] - ativa modo caveman (terse, poucos tokens)");
+  console.log("  /url [preset|url]      - mostra/troca URL da API (openrouter, openai, anthropic, etc)");
   console.log("  /api_key [chave]       - define API key para esta sessão");
   console.log("  /clear                 - limpa histórico");
-  console.log("  /stop [nome]           - para processo (sem nome = para ativo)");
   console.log("  /kill [nome]           - mata processo (sem confirmação, sem nome = ativo)");
   console.log("  /ps                    - lista processos gerenciados");
   console.log("  /h, /help              - mostra esta ajuda");
@@ -689,7 +779,8 @@ async function autoAttachFiles(input: string): Promise<string> {
   while ((m = filePattern.exec(input)) !== null) {
     const candidate = m[1];
     // Skip obvious non-files
-    if (["com", "br", "net", "org", "io", "que", "por", "para"].includes(candidate.split(".").pop()!)) continue;
+    const tld = candidate?.split(".").pop();
+    if (!candidate || ["com", "br", "net", "org", "io", "que", "por", "para"].includes(tld ?? "")) continue;
     if (candidate.length < 3) continue;
     mentioned.add(candidate);
   }
@@ -711,57 +802,131 @@ async function autoAttachFiles(input: string): Promise<string> {
 
 // --- Chat API ---
 
-async function chat(apiKey: string, userMessage: string, model: string): Promise<string> {
+async function chat(apiKey: string, userMessage: string, model: string, fallbackModel?: string): Promise<string> {
   messages.push({ role: "user", content: userMessage });
+  
+  let currentModel = model;
+  let retryCount = 0;
+  const maxRetries = fallbackModel ? MAX_RETRIES : 0;
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const stopSpinner = startSpinner();
-    let res: Response;
+  while (retryCount <= maxRetries) {
     try {
-      res = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ model, messages }),
-      });
-    } finally {
-      stopSpinner();
-    }
-    if (!res || !res.ok) {
-      const err = await res.text();
+      return await chatWithModel(apiKey, currentModel);
+    } catch (err: any) {
+      // Se não há fallback ou já tentamos fallback, relança erro
+      if (!fallbackModel || retryCount > 0) {
+        messages.pop();
+        throw err;
+      }
+      
+      // Se falhou e há fallback, tenta com fallback
+      if (err instanceof APIError && fallbackModel && fallbackModel !== currentModel) {
+        console.log(`\n⚠️  Modelo principal falhou. Tentando fallback: ${fallbackModel}...\n`);
+        currentModel = fallbackModel;
+        retryCount++;
+        // Remove última mensagem user e tenta de novo
+        messages.pop();
+        messages.push({ role: "user", content: userMessage });
+        continue;
+      }
+      
       messages.pop();
-      throw new Error(`API error ${res.status}: ${err}`);
-    }
-
-    const data = (await res.json()) as any;
-    const assistantMsg = data.choices?.[0]?.message?.content ?? "(sem resposta)";
-    messages.push({ role: "assistant", content: assistantMsg });
-
-    const { calls, cleaned } = parseToolCalls(assistantMsg);
-
-    if (calls.length === 0) {
-      // No tool calls — show the response
-      return assistantMsg;
-    }
-
-    // Execute tool calls and feed results back
-    const toolResults = await executeToolCalls(calls);
-    messages.push({
-      role: "user",
-      content: `[Resultados das ferramentas]:\n\n${toolResults}`,
-    });
-
-    // If there was text alongside tool calls, show it
-    if (cleaned) {
-      process.stdout.write(`\n${cleaned}\n\n[Executando ferramentas...]\n`);
-    } else {
-      process.stdout.write(`[Executando ferramentas...]\n`);
+      throw err;
     }
   }
+  
+  messages.pop();
+  return "(erro após tentar fallback)";
+}
 
-  return "(limite de rodadas de ferramentas atingido)";
+async function chatWithModel(apiKey: string, model: string): Promise<string> {
+  let stopSpinner = startSpinner(`⏳ Processando...`);
+  
+  try {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      let res: Response;
+      try {
+        res = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ model, messages }),
+        });
+      } catch (err: any) {
+        throw new APIError(`Falha na conexão com API: ${err.message}`, 0);
+      }
+      
+      if (!res || !res.ok) {
+        const err = await res.text();
+        const statusCode = res?.status || 500;
+        if (statusCode === 401) {
+          throw new APIError("API key inválida ou expirada", 401);
+        } else if (statusCode === 429) {
+          throw new APIError("Rate limit atingido. Aguarde alguns minutos.", 429);
+        } else if (statusCode >= 500) {
+          throw new APIError(`Erro no servidor OpenRouter: ${statusCode}`, statusCode);
+        } else {
+          throw new APIError(`Erro na API (${statusCode}): ${err.substring(0, 100)}`, statusCode);
+        }
+      }
+
+      const data = (await res.json()) as any;
+      const assistantMsg = data.choices?.[0]?.message?.content ?? "(sem resposta)";
+      messages.push({ role: "assistant", content: assistantMsg });
+      // Check for planning tags first
+      const planMatch = assistantMsg.match(/<plan>([\s\S]*?)<\/plan>/);
+      if (planMatch && round === 0) {
+        // Found a plan on first round - show it and ask for approval
+        const plan = planMatch[1].trim();
+        stopSpinner();
+        console.log(`\n📋 PLANO:\n${plan}\n`);
+        const approved = (await ask("Aceitar plano? (y/n/Enter para sim): ", true)).trim().toLowerCase();
+        
+        if (approved !== "y" && approved !== "yes") {
+          console.log("Plano rejeitado pelo usuário.");
+          // Remove the assistant message and the user message that generated it
+          messages.pop();
+          return `Plano rejeitado. Pode descrever suas mudanças?`;
+        }
+        
+        console.log("✓ Plano aprovado. Executando...\n");
+        stopSpinner = startSpinner(`⏳ Executando plano...`);
+        // Continue with tool execution
+      }
+
+
+
+
+      const { calls, cleaned } = parseToolCalls(assistantMsg);
+
+      if (calls.length === 0) {
+        // No tool calls — show the response
+        stopSpinner();
+        return assistantMsg;
+      }
+
+      // If there was text alongside tool calls, show it (spinner still active)
+      if (cleaned) {
+        process.stdout.write(`\n${cleaned}\n`);
+      }
+      process.stdout.write(`\n[Executando ferramentas...]\n`);
+      
+      // Execute tool calls and feed results back (spinner still active)
+      const toolResults = await executeToolCalls(calls);
+      messages.push({
+        role: "user",
+        content: `[Resultados das ferramentas]:\n\n${toolResults}`,
+      });
+    }
+    
+    stopSpinner();
+    return "(limite de rodadas de ferramentas atingido)";
+  } catch (err: any) {
+    stopSpinner();
+    throw err;
+  }
 }
 
 // --- Main ---
@@ -774,7 +939,7 @@ async function main() {
   function parseArgs(argv: string[]) {
     const out: { apiKey?: string; model?: string } = {};
     for (let i = 2; i < argv.length; i++) {
-      const a = argv[i];
+      const a = argv[i]!;
       if (a.startsWith("--api_key=")) {
         out.apiKey = a.slice("--api_key=".length);
       } else if (a === "--api_key") {
@@ -791,6 +956,16 @@ async function main() {
   const parsed = parseArgs(process.argv);
 
   const settings = loadSettings();
+
+  function getAllowedModelsList(): string[] {
+    const extra: string[] = Array.isArray(settings.allowedExtraModels) ? settings.allowedExtraModels : [];
+    return ALLOWED_MODELS.concat(extra);
+  }
+
+  function isModelAllowed(m: string): boolean {
+    if (!m) return false;
+    return getAllowedModelsList().includes(m);
+  }
 
   function readEnvApiKey(): string | undefined {
     const names = ["API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "THCHAT_API_KEY"];
@@ -812,6 +987,14 @@ async function main() {
 
   let finalApiKey = (parsed.apiKey || readEnvApiKey() || settings.apiKey || "").trim();
   let modelUsed = (parsed.model || readEnvModel() || settings.model || DEFAULT_MODELS[0] || MODEL_DEFAULT).trim();
+  let fallbackModel = settings.fallbackModel || FALLBACK_MODEL_DEFAULT;
+  cavemanMode = settings.cavemanMode || "off";
+  apiUrl = settings.apiUrl || API_URL_DEFAULTS.openrouter;
+
+  // Restore caveman mode in system prompt if it was saved
+  if (cavemanMode !== "off") {
+    updateSystemPromptWithCaveman(cavemanMode);
+  }
 
   let askedApiKey = false;
   if (!finalApiKey) {
@@ -839,7 +1022,7 @@ async function main() {
   // persist model to per-user settings (do NOT save API key to project .env)
   if (parsed.model) saveSettings({ model: modelUsed });
 
-  printHelp(modelUsed);
+  printHelp(modelUsed, fallbackModel);
 
   while (true) {
     const input = (await ask("Você: ")).trim();
@@ -854,7 +1037,7 @@ async function main() {
     }
 
     if (input === "/h" || input === "/help") {
-      printHelp(modelUsed);
+      printHelp(modelUsed, fallbackModel);
       continue;
     }
 
@@ -884,20 +1067,54 @@ async function main() {
       if (!arg) {
         console.log(`Modelo atual: ${modelUsed}`);
         console.log("Modelos permitidos:");
-        for (const m of ALLOWED_MODELS) console.log("  - " + m);
-        console.log("Use '/model <nome>' para trocar e salvar no settings do usuário\n");
+        for (const m of getAllowedModelsList()) console.log("  - " + m);
+        console.log("Use '/model <nome>' para trocar e salvar no settings do usuário");
+        console.log("Use '/model add <nome>' para adicionar modelo aos permitidos\n");
+        continue;
+      }
+      // support adding/removing allowed models without editing source
+      if (arg.startsWith("add ") || arg.startsWith("rm ") || arg.startsWith("remove ")) {
+        const parts = arg.split(/\s+/);
+        const cmd = parts[0];
+        const name = parts.slice(1).join(" ").trim();
+        if (!name) {
+          console.log("Uso: /model add <nome>  ou  /model rm <nome>\n");
+          continue;
+        }
+        // ensure settings.allowedExtraModels exists
+        if (!Array.isArray(settings.allowedExtraModels)) settings.allowedExtraModels = [];
+        if (cmd === "add") {
+          if (isModelAllowed(name)) {
+            console.log(`Modelo já permitido: ${name}\n`);
+            continue;
+          }
+          settings.allowedExtraModels.push(name);
+          saveSettings({ allowedExtraModels: settings.allowedExtraModels });
+          console.log(`Modelo adicionado aos permitidos: ${name}\n`);
+          continue;
+        }
+        if (cmd === "rm" || cmd === "remove") {
+          const idx = settings.allowedExtraModels.indexOf(name);
+          if (idx === -1) {
+            console.log(`Modelo não encontrado entre extras: ${name}\n`);
+            continue;
+          }
+          settings.allowedExtraModels.splice(idx, 1);
+          saveSettings({ allowedExtraModels: settings.allowedExtraModels });
+          console.log(`Modelo removido da lista extra: ${name}\n`);
+          continue;
+        }
+      }
+
+      if (!isModelAllowed(arg)) {
+        console.log(`Modelo não permitido: ${arg}`);
+        console.log("Ver modelos permitidos com '/model'\n");
         continue;
       }
 
-        if (!ALLOWED_MODELS.includes(arg)) {
-          console.log(`Modelo não permitido: ${arg}`);
-          console.log("Ver modelos permitidos com '/model'\n");
-          continue;
-        }
-
-        modelUsed = arg;
-        saveSettings({ model: modelUsed });
-        console.log(`Modelo alterado para: ${modelUsed} (salvo em settings do usuário)\n`);
+      modelUsed = arg;
+      saveSettings({ model: modelUsed });
+      console.log(`Modelo alterado para: ${modelUsed} (salvo em settings do usuário)\n`);
       continue;
     }
 
@@ -921,11 +1138,112 @@ async function main() {
       continue;
     }
 
+    // /fallback command: set or show fallback model
+    if (input.startsWith("/fallback")) {
+      const arg = input.slice(9).trim();
+      if (!arg) {
+        console.log(`Modelo de fallback atual: ${fallbackModel}`);
+        console.log("Modelos permitidos:");
+        for (const m of getAllowedModelsList()) console.log("  - " + m);
+        console.log("Use '/fallback <nome>' para trocar e salvar no settings do usuário\n");
+        continue;
+      }
+
+      if (!isModelAllowed(arg)) {
+        console.log(`Modelo não permitido: ${arg}`);
+        console.log("Ver modelos permitidos com '/fallback'\n");
+        continue;
+      }
+
+      fallbackModel = arg;
+      saveSettings({ fallbackModel });
+      console.log(`Modelo de fallback alterado para: ${fallbackModel} (salvo em settings do usuário)\n`);
+      continue;
+    }
+
+    // /url command: set or show API URL
+    if (input.startsWith("/url")) {
+      const arg = input.slice(4).trim();
+      if (!arg) {
+        console.log(`URL da API atual: ${apiUrl}`);
+        console.log("\nPresets disponíveis:");
+        for (const [name, url] of Object.entries(API_URL_DEFAULTS)) {
+          console.log(`  ${name.padEnd(12)} - ${url}`);
+        }
+        console.log("\nUso:");
+        console.log("  /url <preset>        - muda para um preset (openrouter, openai, anthropic, etc)");
+        console.log("  /url https://...     - muda para URL customizada\n");
+        continue;
+      }
+
+      let newUrl: string | undefined;
+
+      // Check if it's a preset
+      if (arg.toLowerCase() in API_URL_DEFAULTS) {
+        newUrl = API_URL_DEFAULTS[arg.toLowerCase() as keyof typeof API_URL_DEFAULTS];
+        console.log(`✓ URL alterada para preset '${arg.toLowerCase()}': ${newUrl}`);
+      } else if (arg.startsWith("http://") || arg.startsWith("https://")) {
+        // Custom URL
+        newUrl = arg;
+        console.log(`✓ URL customizada definida: ${newUrl}`);
+      } else {
+        console.log(`❌ Preset inválido ou URL não começa com http:// ou https://`);
+        console.log("Presets conhecidos: " + Object.keys(API_URL_DEFAULTS).join(", ") + "\n");
+        continue;
+      }
+
+      if (newUrl) {
+        apiUrl = newUrl;
+        saveSettings({ apiUrl: newUrl });
+        console.log("(salvo em settings do usuário)\n");
+      }
+      continue;
+    }
+
+    // /caveman command: activate caveman mode (lite, full, ultra)
+    if (input.startsWith("/caveman")) {
+      const arg = input.slice(8).trim().toLowerCase();
+      if (!arg) {
+        console.log(`Modo caveman atual: ${cavemanMode !== "off" ? cavemanMode.toUpperCase() : "OFF"}`);
+        console.log("Intensidades disponíveis:");
+        console.log("  /caveman lite   - terse, sem fluff, mas gramaticalmente correto");
+        console.log("  /caveman full   - caveman completo, fragmentos OK, menos tokens");
+        console.log("  /caveman ultra  - máxima compressão, telegráfico, abreviações");
+        console.log("  /caveman off    - desativa caveman mode\n");
+        continue;
+      }
+
+      const validModes = ["lite", "full", "ultra", "off"];
+      if (!validModes.includes(arg)) {
+        console.log(`Modo inválido: ${arg}`);
+        console.log("Modos válidos: lite, full, ultra, off\n");
+        continue;
+      }
+
+      cavemanMode = arg as CavemanLevel;
+      updateSystemPromptWithCaveman(cavemanMode);
+      saveSettings({ cavemanMode });
+      
+      if (cavemanMode === "off") {
+        console.log(`🪨 Caveman mode desativado. Voltando ao normal.\n`);
+      } else {
+        console.log(`🪨 Caveman mode ativado: ${cavemanMode.toUpperCase()}`);
+        console.log(`   why use many token when few do trick\n`);
+      }
+      continue;
+    }
+
     // /run command: run one-off shell command after explicit consent
     if (input.startsWith("/run ")) {
       const cmd = input.slice(5).trim();
       if (!cmd) {
         console.log("Uso: /run <comando>\n");
+        continue;
+      }
+      // Validate command safety
+      const validation = validateShellCommand(cmd);
+      if (!validation.safe) {
+        console.log(`❌ Comando rejeitado: ${validation.reason}\n`);
         continue;
       }
       const ok = (await ask(`Executar comando (projeto ${process.cwd()}): ${cmd} ? (y/n): `)).trim().toLowerCase();
@@ -935,9 +1253,15 @@ async function main() {
       }
       try {
         await runCommand(cmd, process.cwd());
-        console.log(`Comando '${cmd}' finalizado.`);
+        console.log(`✓ Comando '${cmd}' finalizado.\n`);
       } catch (e: any) {
-        console.error(`Erro: ${e.message}`);
+        if (e instanceof CommandExecutionError) {
+          console.error(`❌ Erro na execução: ${e.message}`);
+          if (e.exitCode) console.error(`   Exit code: ${e.exitCode}`);
+        } else {
+          console.error(`❌ Erro inesperado: ${(e as any).message}`);
+        }
+        console.log();
       }
       continue;
     }
@@ -1007,10 +1331,20 @@ async function main() {
       // Auto-attach mentioned files
       enriched = await autoAttachFiles(enriched);
 
-      const reply = await chat(finalApiKey, enriched, modelUsed);
+      const reply = await chat(finalApiKey, enriched, modelUsed, fallbackModel);
       console.log(`\nAssistente: ${reply}\n`);
     } catch (e: any) {
-      console.error(`\nErro: ${e.message}\n`);
+      if (e instanceof APIError) {
+        console.error(`\n❌ Erro API (${e.code}): ${e.message}\n`);
+        if (e.statusCode === 401) console.error("   Dica: Verifique sua API key com /api_key\n");
+        if (e.statusCode === 429) console.error("   Dica: Aguarde alguns minutos antes de tentar novamente\n");
+      } else if (e instanceof ValidationError) {
+        console.error(`\n❌ Erro de validação: ${e.message}\n`);
+      } else if (e instanceof AppError) {
+        console.error(`\n❌ Erro (${e.code}): ${e.message}\n`);
+      } else {
+        console.error(`\n❌ Erro inesperado: ${(e as any).message}\n`);
+      }
     }
   }
 
@@ -1024,7 +1358,7 @@ async function resolveAtFiles(input: string): Promise<string> {
   let match: RegExpExecArray | null;
 
   while ((match = filePattern.exec(input)) !== null) {
-    const filePath = match[1];
+    const filePath = match[1]!;
     const content = await readFileAsync(filePath);
     if (!content.startsWith("[ERRO")) {
       files.set(filePath, content);

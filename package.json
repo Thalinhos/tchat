@@ -7,7 +7,9 @@
     "tchat": "./tchat.exe"
   },
   "scripts": {
-    "start": "bun run index.ts"
+    "start": "bun run index.ts",
+    "build": "bun build index.ts --compile --outfile tchat.exe --minify",
+    "link": "bun link"
   },
   "devDependencies": {
     "@types/bun": "latest"
