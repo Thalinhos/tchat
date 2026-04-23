@@ -107,7 +107,46 @@ Ferramentas para o assistente IA manipular arquivos:
 <search_files>padrão</search_files>
 ```
 
-### 5. **Process Management**
+**Ordem de execução determinística (evita race conditions):**
+1. Read files
+2. List directories
+3. Search files
+4. Write files (com confirmação do usuário)
+5. Run commands (com confirmação do usuário)
+
+### 5. **Tool Call Parsing & Serialization** (`parseToolCalls()`)
+
+Extrai tool calls da resposta IA e garante ordem segura:
+
+```typescript
+function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string }
+  ├─ Remover <plan> tags
+  ├─ Parse read_file (1º)
+  ├─ Parse list_dir (2º)
+  ├─ Parse search_files (3º)
+  ├─ Parse write_file (4º)
+  ├─ Parse run_command (5º)
+  ├─ Parse run_command_bg (6º)
+  └─ Auto-correct run_command → run_command_bg se necessário
+```
+
+### 6. **Auto-Attach Files Context** (`attachedFilesContext`)
+
+Map que cacheializa conteúdo de arquivos mencionados:
+
+```typescript
+const attachedFilesContext = new Map<string, string>()
+
+Fluxo:
+1. User: "Can you review index.ts?"
+2. autoAttachFiles() detecta "index.ts"
+3. attachedFilesContext.set("index.ts", content)
+4. Próxima mensagem: "Also check config.ts"
+5. attachedFilesContext já tem index.ts em cache
+6. Só lê disco se arquivo novo
+```
+
+### 7. **Process Management**
 
 Gerencia processos em background:
 
@@ -120,7 +159,7 @@ Gerencia processos em background:
 
 Mapa interno: `Map<name, ManagedProc>`
 
-### 6. **Settings Persistência**
+### 8. **Settings Persistência**
 
 Armazena em `~/.config/thchat/settings.json` (Linux/Mac) ou `%APPDATA%\thchat\settings.json` (Windows):
 
@@ -129,6 +168,8 @@ Armazena em `~/.config/thchat/settings.json` (Linux/Mac) ou `%APPDATA%\thchat\se
   "apiKey": "sk-...",
   "model": "anthropic/claude-haiku-4.5",
   "fallbackModel": "openai/gpt-oss-120b:free",
+  "cavemanMode": "full",
+  "apiUrl": "https://openrouter.ai/api/v1/chat/completions",
   "allowedExtraModels": ["custom/model-1", "custom/model-2"]
 }
 ```
@@ -199,6 +240,169 @@ Detecta nomes de arquivo inválidos, modelos bloqueados, etc.
 
 ---
 
+## � Planning Flow
+
+Quando IA propõe um plano (envolvido em `<plan>...</plan>`):
+
+```
+1. IA responde com <plan>...</plan>
+   │
+2. Cliente extrai conteúdo do plano
+   │
+3. Mostra para usuário:
+   "📋 PLANO:
+    I will:
+    1. Ler index.ts
+    2. Atualizar config
+    3. Reiniciar serviço"
+   │
+4. Pergunta: "Aceitar plano? (y/n/Enter para sim): "
+   │
+   ├─ Usuário pressiona Enter/y → Aprova
+   │  │
+   │  └─ IA continua com execução (tool calls, edits)
+   │
+   └─ Usuário digita "n" → Rejeita
+      │
+      └─ Cliente remove plano e pede novamente: "Plano rejeitado. Pode descrever suas mudanças?"
+```
+
+**Implementação:**
+```typescript
+if (planMatch && !planApproved) {
+  stopSpinner();
+  console.log(`\n📋 PLANO:\n${plan}\n`);
+  const approved = await ask("Aceitar plano? (y/n/Enter para sim): ", true);
+  
+  if (approved !== "y" && approved !== "yes") {
+    messages.pop();  // Remove plano rejeitado
+    return `Plano rejeitado. Pode descrever suas mudanças?`;
+  }
+  
+  planApproved = true;
+  console.log("✓ Plano aprovado. Executando...\n");
+  messages.push({ role: "user", content: "Plano aprovado. Execute as ações descritas no plano." });
+  continue;  // Next loop executa tool calls
+}
+```
+
+---
+
+## 🔄 Fallback Decision Tree
+
+Estratégia automática de fallback em caso de falha:
+
+```
+API Request (model = primary)
+  ↓
+API responds?
+├─ ✓ SIM → Parse resposta, continuar
+│
+└─ ✗ NÃO → catch erro
+   ├─ Status 401 (Unauthorized)
+   │  └─ ❌ Não tenta fallback
+   │     └─ Throw: "API key inválida ou expirada"
+   │
+   ├─ Status 429 (Too Many Requests)
+   │  └─ ❌ Não tenta fallback
+   │     └─ Throw: "Rate limit atingido. Aguarde alguns minutos."
+   │
+   ├─ Status 500+ (Server Error)
+   │  └─ ✓ Tenta fallback
+   │     └─ model = fallback
+   │        └─ Retry API Request
+   │
+   └─ ConnectionError (timeout, network down)
+      └─ ✓ Tenta fallback
+         └─ model = fallback
+            └─ Retry API Request
+```
+
+**Código:**
+```typescript
+async function chat(apiKey, userMessage, model, fallbackModel) {
+  let currentModel = model;
+  let retryCount = 0;
+  const maxRetries = fallbackModel ? MAX_RETRIES : 0;
+
+  while (retryCount <= maxRetries) {
+    try {
+      return await chatWithModel(apiKey, currentModel);
+    } catch (err) {
+      // Não tentar fallback para 401, 429
+      if (err instanceof APIError && (err.statusCode === 401 || err.statusCode === 429)) {
+        throw err;  // Falha e não retenta
+      }
+      
+      // Se não há fallback ou já tentou, relança
+      if (!fallbackModel || retryCount > 0) {
+        throw err;
+      }
+      
+      // Tenta com fallback
+      console.log(`⚠️  Modelo principal falhou. Tentando fallback: ${fallbackModel}...`);
+      currentModel = fallbackModel;
+      retryCount++;
+    }
+  }
+}
+```
+
+---
+
+## 🎯 Command Dispatcher
+
+Fluxo principal que processa entrada do usuário:
+
+```
+┌──────────────────────┐
+│  Entrada do usuário  │
+└──────────┬───────────┘
+           │
+           ▼
+    ┌─────────────────┐
+    │ É comando (/) ? │
+    └────────┬────────┘
+    ┌────────▼────────┐
+    │ /ls, /cd, /run, │
+    │ /model, /help,  │
+    │ /accept, /reject│
+    │ /start, /ps...  │
+    └────────┬────────┘
+             │
+    ┌────────▼────────────────┐
+    │ Execute comando local   │
+    │ (sem enviar para IA)    │
+    └────────┬────────────────┘
+             │
+             ├─ /help → printHelp()
+             ├─ /ls → listDirAsync()
+             ├─ /cd → process.chdir()
+             ├─ /model → ler/mudar modelo
+             ├─ /run → validar + executar comando
+             ├─ /accept on/off → mudar sessionAcceptAll
+             ├─ /reject on/off → mudar sessionRejectAll
+             ├─ /start → iniciar processo background
+             ├─ /stop → parar processo
+             ├─ /ps → listar processos
+             └─ ...
+             
+             NÃO é comando
+             │
+             ▼
+    ┌─────────────────────────┐
+    │ Processar mensagem IA   │
+    │ 1. Auto-attach files    │
+    │ 2. Resolve @files       │
+    │ 3. chat(input)          │
+    │ 4. Parse tool calls     │
+    │ 5. Execute tools        │
+    │ 6. Loop até resposta    │
+    └─────────────────────────┘
+```
+
+---
+
 ## 🔄 Fluxo de Chat com Ferramentas
 
 ```
@@ -220,7 +424,7 @@ Detecta nomes de arquivo inválidos, modelos bloqueados, etc.
    │
 6. API responde com explicação
    │
-7. Máximo 10 rodadas de ferramentas (MAX_TOOL_ROUNDS)
+7. Máximo 20 rodadas de ferramentas (MAX_TOOL_ROUNDS = 20)
 ```
 
 ---

@@ -47,6 +47,8 @@ const DANGEROUS_PATTERNS = [
   /[;|&<>]/,                                     // pipes, redirects, command separators
   /`|\$\(|\)\s*\|/,                          // backticks or command substitution
   /\b(ncat|nc|curl|wget)\b\s+\-O/i,          // common downloaders with -O
+  /[<>]/,                                        // output/input redirection
+  /\b(tee|xargs)\b/i,                         // piping/chaining tools
 ];
 
 function validateShellCommand(cmd: string): { safe: boolean; reason?: string } {
@@ -96,8 +98,9 @@ const ALLOWED_MODELS = [
   "anthropic/claude-opus-4.7",
   "qwen/qwen3.6-plus",
 ];
-const MAX_TOOL_ROUNDS = 10;
+const MAX_TOOL_ROUNDS = 20;
 const MAX_RETRIES = 2; // Número máximo de retries com fallback
+const API_TIMEOUT_MS = 60000; // 60 second timeout for fetch
 
 // Caveman mode instructions
 const CAVEMAN_INSTRUCTIONS = {
@@ -401,6 +404,9 @@ let sessionRejectAll = false;
 let cavemanMode: CavemanLevel = "off";
 let apiUrl = API_URL_DEFAULTS.openrouter;
 
+// Context map: keep file contents for reuse across messages
+const attachedFilesContext = new Map<string, string>();
+
 function ask(prompt: string, acceptEmptyAsYes: boolean = false): Promise<string> {
   return new Promise((resolve) => {
     // ensure any active spinner cleared so prompt appears clean
@@ -425,7 +431,7 @@ function updateSystemPromptWithCaveman(mode: CavemanLevel): void {
   let systemContent = SYSTEM_PROMPT;
   
   // Remove existing caveman instruction if present
-  systemContent = systemContent.replace(/## Caveman Mode:.*?(?=\n---|\n\n|$)/s, "").trim();
+  systemContent = systemContent.replace(/## Caveman Mode:[\s\S]*?(?=\n---|\n\n|$)/, "").trim();
   
   // Add new caveman instruction if not "off"
   if (mode !== "off" && CAVEMAN_INSTRUCTIONS[mode]) {
@@ -741,16 +747,12 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
   // Remove <plan>...</plan> tags (não são tool calls)
   cleaned = cleaned.replace(/<plan>[\s\S]*?<\/plan>/g, "").trim();
 
-  // Parse <write_file path="...">content</write_file>
-  const writeRegex = /<write_file\s+path="([^"]+)">([\s\S]*?)<\/write_file>/g;
-  let match: RegExpExecArray | null;
-  while ((match = writeRegex.exec(text)) !== null) {
-    calls.push({ type: "write_file", path: match[1], content: match[2], raw: match[0] });
-  }
-  cleaned = cleaned.replace(writeRegex, "");
+  // Ordem DETERMINÍSTICA: read → list → search → write → commands
+  // Isso evita race conditions (read antes de write)
 
   // Parse <read_file>path</read_file>
   const readRegex = /<read_file>([\s\S]*?)<\/read_file>/g;
+  let match: RegExpExecArray | null;
   while ((match = readRegex.exec(text)) !== null) {
     if (match[1]) calls.push({ type: "read_file", path: match[1].trim(), raw: match[0] });
   }
@@ -769,6 +771,13 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
     if (match[1]) calls.push({ type: "search_files", pattern: match[1].trim(), raw: match[0] });
   }
   cleaned = cleaned.replace(searchRegex, "");
+
+  // Parse <write_file path="...">content</write_file>
+  const writeRegex = /<write_file\s+path="([^"]+)">([\s\S]*?)<\/write_file>/g;
+  while ((match = writeRegex.exec(text)) !== null) {
+    calls.push({ type: "write_file", path: match[1], content: match[2], raw: match[0] });
+  }
+  cleaned = cleaned.replace(writeRegex, "");
 
   // Parse <run_command>comando</run_command>
   const runCmdRegex = /<run_command>([\s\S]*?)<\/run_command>/g;
@@ -935,6 +944,7 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log(`\nModelo: ${modelUsed}`);
   console.log(`Fallback: ${fallbackModel || "nenhum"}`);
   console.log(`Caveman: ${cavemanMode !== "off" ? cavemanMode.toUpperCase() : "off"}`);
+  console.log(`Modificações: ${sessionAcceptAll ? "aceitar todas" : sessionRejectAll ? "rejeitar todas" : "perguntar"}`);
   console.log(`URL API: ${apiUrl}`);
   console.log(`Diretório: ${process.cwd()}`);
   console.log("\nRecursos:");
@@ -949,10 +959,15 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log("  /model rm <nome>       - remove modelo adicionado");
   console.log("  /fallback [nome]       - mostra/troca modelo de fallback (usado se principal falhar)");
   console.log("  /caveman [lite|full|ultra] - ativa modo caveman (terse, poucos tokens)");
+  console.log("  /accept [on|off]       - auto-aceitar modificações (padrão: perguntar)");
+  console.log("  /reject [on|off]       - auto-rejeitar modificações (padrão: perguntar)");
   console.log("  /url [preset|url]      - mostra/troca URL da API (openrouter, openai, anthropic, etc)");
   console.log("  /api_key [chave]       - define API key para esta sessão");
   console.log("  /clear                 - limpa histórico");
-  console.log("  /kill [nome]           - mata processo (sem confirmação, sem nome = ativo)");
+  console.log("  /run <cmd>             - executa comando com validação");
+  console.log("  /start [--fg] <name> <cmd> - inicia processo gerenciado");
+  console.log("  /stop [nome]           - para processo (com confirmação)");
+  console.log("  /kill [nome]           - mata processo (sem confirmação)");
   console.log("  /ps                    - lista processos gerenciados");
   console.log("  /logs [nome] [linhas]  - mostra logs do processo (padrão: ativo, 80 linhas)");
   console.log("  /h, /help              - mostra esta ajuda");
@@ -980,7 +995,14 @@ async function autoAttachFiles(input: string): Promise<string> {
 
   const attached: string[] = [];
   for (const name of mentioned) {
-    const content = await readFileAsync(name);
+    // Check context first before reading disk
+    let content = attachedFilesContext.get(name);
+    if (!content) {
+      content = await readFileAsync(name);
+      if (!content.startsWith("[ERRO") && !content.startsWith("[DIRET")) {
+        attachedFilesContext.set(name, content);
+      }
+    }
     if (!content.startsWith("[ERRO") && !content.startsWith("[DIRET")) {
       attached.push(`[Arquivo mencionado: ${name}]\n\`\`\`\n${content}\n\`\`\``);
     }
@@ -1038,15 +1060,25 @@ async function chatWithModel(apiKey: string, model: string): Promise<string> {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       let res: Response;
       try {
-        res = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({ model, messages }),
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+        try {
+          res = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({ model, messages }),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
       } catch (err: any) {
+        if (err.name === "AbortError") {
+          throw new APIError(`Timeout na API: nenhuma resposta em ${API_TIMEOUT_MS / 1000}s`, 0);
+        }
         throw new APIError(`Falha na conexão com API: ${err.message}`, 0);
       }
       
@@ -1214,6 +1246,15 @@ async function main() {
   }
 
   if (!modelUsed) modelUsed = DEFAULT_MODELS[0] || MODEL_DEFAULT;
+
+  // Validate model is in allowed list
+  if (!isModelAllowed(modelUsed)) {
+    console.error(`❌ Modelo não permitido: ${modelUsed}`);
+    console.error(`Modelos permitidos: ${getAllowedModelsList().join(", ")}`);
+    console.error(`Use '/model' para escolher um permitido.\n`);
+    rl.close();
+    return;
+  }
 
   // persist model to per-user settings (do NOT save API key to project .env)
   if (parsed.model) saveSettings({ model: modelUsed });
@@ -1415,6 +1456,38 @@ async function main() {
         apiUrl = newUrl;
         saveSettings({ apiUrl: newUrl });
         console.log("(salvo em settings do usuário)\n");
+      }
+      continue;
+    }
+
+    // /accept command: toggle auto-accept modifications
+    if (input.startsWith("/accept")) {
+      const arg = input.slice(7).trim().toLowerCase();
+      if (!arg || arg === "on") {
+        sessionAcceptAll = true;
+        sessionRejectAll = false;
+        console.log(`✓ Modo: aceitar todas as modificações automaticamente\n`);
+      } else if (arg === "off") {
+        sessionAcceptAll = false;
+        console.log(`✓ Modo: perguntar antes de cada modificação\n`);
+      } else {
+        console.log("Uso: /accept [on|off]\n");
+      }
+      continue;
+    }
+
+    // /reject command: toggle auto-reject modifications
+    if (input.startsWith("/reject")) {
+      const arg = input.slice(7).trim().toLowerCase();
+      if (!arg || arg === "on") {
+        sessionRejectAll = true;
+        sessionAcceptAll = false;
+        console.log(`✓ Modo: rejeitar todas as modificações automaticamente\n`);
+      } else if (arg === "off") {
+        sessionRejectAll = false;
+        console.log(`✓ Modo: perguntar antes de cada modificação\n`);
+      } else {
+        console.log("Uso: /reject [on|off]\n");
       }
       continue;
     }
