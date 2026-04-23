@@ -82,7 +82,7 @@ const API_URL_DEFAULTS = {
   anthropic: "https://api.anthropic.com/v1/messages",
   groq: "https://api.groq.com/openai/v1/chat/completions",
   deepseek: "https://api.deepseek.com/v1/chat/completions",
-  nvidia: "https://integrate.api.nvidia.com/v1/chat/completions",
+  nvidia: "https://integrate.api.nvidia.com/v1/chat/completions", //currently not working well
 };
 
 const MODEL_DEFAULT = "z-ai/glm-4.5-air:free";
