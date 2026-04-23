@@ -2,7 +2,7 @@ import * as readline from "readline";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // --- Error handling ---
 class AppError extends Error {
@@ -39,23 +39,38 @@ class CommandExecutionError extends AppError {
 
 // Safe command validator
 const DANGEROUS_PATTERNS = [
-  /^\s*(rm|rmdir|del|deltree|rd|unlink)\s+/i,  // delete commands
-  /^\s*format\s+/i,                              // format drives
-  /^\s*wipe\s+/i,                                // secure wipe
-  /^\s*shutdown\s+/i,                            // shutdown
-  /&&\s*(rm|del|format|wipe)/i,                  // chained dangerous
-  /\|\s*(rm|del|format|wipe)/i,                 // piped dangerous
-  />.*\s+(\\\|\/)\\\.*$/i,                       // redirect to system dirs
+  /(^|\s)(rm|rmdir|del|deltree|rd|unlink)\b/i, // delete commands
+  /(^|\s)format\b/i,                           // format drives
+  /(^|\s)wipe\b/i,                             // secure wipe
+  /(^|\s)shutdown\b/i,                         // shutdown
+  /\b(dd|mkfs)\b/i,                            // destructive tools
+  /[;|&<>]/,                                     // pipes, redirects, command separators
+  /`|\$\(|\)\s*\|/,                          // backticks or command substitution
+  /\b(ncat|nc|curl|wget)\b\s+\-O/i,          // common downloaders with -O
 ];
 
 function validateShellCommand(cmd: string): { safe: boolean; reason?: string } {
   if (!cmd || !cmd.trim()) return { safe: false, reason: "Comando vazio" };
-  
+
+  // normalize spaces to make obfuscation harder
+  const normalized = cmd.replace(/\s+/g, " ").trim();
+
   for (const pattern of DANGEROUS_PATTERNS) {
-    if (pattern.test(cmd)) {
-      return { safe: false, reason: `Comando bloqueado por segurança: padrão perigoso detectado` };
+    try {
+      if (pattern.test(normalized)) {
+        return { safe: false, reason: `Comando bloqueado por segurança: padrão perigoso detectado (${pattern})` };
+      }
+    } catch {
+      // if a pattern fails, err on the side of safety
+      return { safe: false, reason: "Comando bloqueado por segurança: padrão inválido" };
     }
   }
+
+  // reject if contains obvious redirections or subshells even if spaced out
+  if (/[<>|;&`]/.test(normalized)) {
+    return { safe: false, reason: "Comando contém operadores de shell potencialmente perigosos" };
+  }
+
   return { safe: true };
 }
 
@@ -65,6 +80,7 @@ const API_URL_DEFAULTS = {
   anthropic: "https://api.anthropic.com/v1/messages",
   groq: "https://api.groq.com/openai/v1/chat/completions",
   deepseek: "https://api.deepseek.com/v1/chat/completions",
+  nvidia: "https://integrate.api.nvidia.com/v1/chat/completions",
 };
 
 const MODEL_DEFAULT = "z-ai/glm-4.5-air:free";
@@ -138,16 +154,95 @@ const rl = readline.createInterface({
 
 const fsp = fs.promises;
 
+// Global spinner handle so prompts clear spinner before asking
+let activeSpinnerStop: (() => void) | null = null;
+function clearSpinner() {
+  if (activeSpinnerStop) {
+    try {
+      activeSpinnerStop();
+    } catch {}
+    activeSpinnerStop = null;
+  }
+}
+
 // --- Process management ---
 type ManagedProc = {
   name: string;
   cmd: string;
   cwd?: string;
   proc: ReturnType<typeof spawn>;
+  logPath: string;
+  logStream: fs.WriteStream;
 };
 
 const managedProcesses = new Map<string, ManagedProc>();
+const managedProcessLogs = new Map<string, string>();
 let activeProcessName: string | null = null; // Rastreia processo ativo (último iniciado)
+const BG_LOG_DIR = path.join(os.tmpdir(), "thchat-bg-logs");
+
+function cleanupManagedProcess(name: string, exitCode?: number | null) {
+  const managed = managedProcesses.get(name);
+  if (!managed) return;
+
+  managedProcesses.delete(name);
+  if (activeProcessName === name) activeProcessName = null;
+
+  try {
+    managed.logStream.write(`\n[${new Date().toISOString()}] EXIT ${exitCode ?? "unknown"}\n`);
+    managed.logStream.end();
+  } catch {}
+}
+
+function getTailLines(content: string, lineCount: number): string {
+  const lines = content.split(/\r?\n/);
+  return lines.slice(Math.max(0, lines.length - lineCount)).join("\n");
+}
+
+function readLogTail(filePath: string, lineCount: number): string {
+  try {
+    const stat = fs.statSync(filePath);
+    const readSize = 64 * 1024; // 64KB
+    let pos = stat.size;
+    let buffer = Buffer.alloc(0);
+    const maxRead = 1024 * 1024; // cap total read to 1MB
+
+    const fd = fs.openSync(filePath, "r");
+    try {
+      while (pos > 0 && buffer.length < maxRead) {
+        const toRead = Math.min(readSize, pos);
+        const start = pos - toRead;
+        const chunk = Buffer.alloc(toRead);
+        fs.readSync(fd, chunk, 0, toRead, start);
+        buffer = Buffer.concat([chunk, buffer]);
+        pos -= toRead;
+
+        // quick check: if we have enough lines, stop
+        const lines = buffer.toString("utf8").split(/\r?\n/);
+        if (lines.length > lineCount + 1) break;
+      }
+    } finally {
+      try { fs.closeSync(fd); } catch {}
+    }
+
+    const chunk = buffer.toString("utf8");
+    return getTailLines(chunk, lineCount);
+  } catch (e: any) {
+    return `[ERRO ao ler logs: ${e.message}]`;
+  }
+}
+
+function getManagedProcessLogs(nameOrActive?: string, lineCount: number = 80): string {
+  const name = nameOrActive || activeProcessName;
+  if (!name) return "[ERRO: nenhum processo ativo ou nome especificado]";
+
+  const logPath = managedProcessLogs.get(name);
+  if (!logPath) return `[ERRO: logs do processo '${name}' não encontrados]`;
+  if (!fs.existsSync(logPath)) return `[ERRO: arquivo de log não existe: ${logPath}]`;
+
+  const safeLineCount = Number.isFinite(lineCount) && lineCount > 0 ? Math.min(500, Math.floor(lineCount)) : 80;
+  const tail = readLogTail(logPath, safeLineCount);
+  return `[logs: ${name} | últimas ${safeLineCount} linhas | ${logPath}]\n${tail}`;
+}
 
 function runCommand(cmd: string, cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -167,19 +262,57 @@ function runCommand(cmd: string, cwd?: string): Promise<void> {
 function startManagedProcess(name: string, cmd: string, cwd?: string): string {
   if (managedProcesses.has(name)) return `[ERRO: processo '${name}' já existe]`;
   try {
-    const ps = spawn(cmd, { shell: true, cwd, stdio: "inherit" });
-    const m: ManagedProc = { name, cmd, cwd, proc: ps };
+    try {
+      fs.mkdirSync(BG_LOG_DIR, { recursive: true });
+    } catch {}
+
+    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const logPath = path.join(BG_LOG_DIR, `${Date.now()}-${safeName}.log`);
+    const logStream = fs.createWriteStream(logPath, { flags: "a", encoding: "utf8" });
+    logStream.write(`[${new Date().toISOString()}] START ${cmd} (cwd=${cwd || process.cwd()})\n`);
+
+    // Background process must not share terminal stdin. Output goes to log file.
+    const detached = process.platform !== "win32";
+    const ps = spawn(cmd, {
+      shell: true,
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      detached,
+    });
+    if (detached) {
+      try {
+        ps.unref();
+      } catch {}
+    }
+
+    ps.stdout?.on("data", (chunk) => {
+      try {
+        logStream.write(chunk);
+      } catch {}
+    });
+    ps.stderr?.on("data", (chunk) => {
+      try {
+        logStream.write(chunk);
+      } catch {}
+    });
+    ps.on("error", (err) => {
+      try {
+        logStream.write(`\n[${new Date().toISOString()}] ERROR ${(err as any).message}\n`);
+      } catch {}
+    });
+
+    const m: ManagedProc = { name, cmd, cwd, proc: ps, logPath, logStream };
     managedProcesses.set(name, m);
+    managedProcessLogs.set(name, logPath);
     activeProcessName = name; // Define como ativo
     ps.on("close", (code) => {
-      managedProcesses.delete(name);
-      // Limpa se era o ativo
-      if (activeProcessName === name) activeProcessName = null;
+      cleanupManagedProcess(name, code);
       try {
         process.stdout.write(`\n[process ${name} exited ${code}]\n`);
       } catch {}
     });
-    return `[OK: processo '${name}' iniciado]`;
+    return `[OK: processo '${name}' iniciado | logs: ${logPath}]`;
   } catch (e: any) {
     return `[ERRO ao iniciar '${name}': ${e.message}]`;
   }
@@ -193,14 +326,57 @@ async function stopManagedProcess(nameOrActive?: string): Promise<string> {
   const m = managedProcesses.get(name);
   if (!m) return `[ERRO: processo '${name}' não encontrado]`;
   try {
-    // try graceful
-    m.proc.kill();
-    // wait small time for exit
-    await new Promise((res) => setTimeout(res, 800));
-    if (managedProcesses.has(name)) {
+    if (m.proc.exitCode !== null) {
+      cleanupManagedProcess(name, m.proc.exitCode);
+      return `[OK: processo '${name}' já estava finalizado]`;
+    }
+
+    const waitForClose = new Promise<number | null>((resolve) => {
+      m.proc.once("close", (code) => resolve(code));
+    });
+
+    // try graceful (platform-specific): kill process tree on Windows, kill process group on POSIX
+    const pid = m.proc.pid;
+    try {
+      if (pid) {
+        if (process.platform === "win32") {
+          try {
+            spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"]);
+          } catch {}
+        } else {
+          try {
+            process.kill(-pid, "SIGTERM");
+          } catch {}
+        }
+      }
+    } catch {}
+    let closeCode = await Promise.race<number | null | "timeout">(([
+      waitForClose,
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1200)),
+    ] as const));
+
+    if (closeCode === "timeout" && managedProcesses.has(name)) {
       try {
-        m.proc.kill("SIGKILL");
+        if (pid) {
+          if (process.platform === "win32") {
+            try {
+              spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"]);
+            } catch {}
+          } else {
+            try {
+              process.kill(-pid, "SIGKILL");
+            } catch {}
+          }
+        }
       } catch {}
+      closeCode = await Promise.race<number | null | "timeout">(([
+        waitForClose,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1200)),
+      ] as const));
+    }
+
+    if (managedProcesses.has(name)) {
+      cleanupManagedProcess(name, closeCode === "timeout" ? null : closeCode);
     }
     return `[OK: processo '${name}' finalizado]`;
   } catch (e: any) {
@@ -227,6 +403,13 @@ let apiUrl = API_URL_DEFAULTS.openrouter;
 
 function ask(prompt: string, acceptEmptyAsYes: boolean = false): Promise<string> {
   return new Promise((resolve) => {
+    // ensure any active spinner cleared so prompt appears clean
+    try {
+      clearSpinner();
+      // push newline to separate previous spinner/output from prompt
+      process.stdout.write('\n');
+    } catch {}
+
     rl.question(prompt, (answer) => {
       // Se acceptEmptyAsYes está ativo e resposta vazia, retorna "y"
       if (acceptEmptyAsYes && answer.trim() === "") {
@@ -262,12 +445,17 @@ function startSpinner(text = "Thinking...") {
     } catch {}
     i++;
   }, 80);
-  return () => {
+  const stop = () => {
     clearInterval(interval);
     try {
       process.stdout.write('\r' + ' '.repeat(80) + '\r');
     } catch {}
+    // clear global handle
+    if (activeSpinnerStop === stop) activeSpinnerStop = null;
   };
+  // set global handle so prompts can clear it
+  activeSpinnerStop = stop;
+  return stop;
 }
 
 // --- File tools ---
@@ -375,7 +563,7 @@ async function writeFile(filePath: string, content: string): Promise<string> {
     } else if (sessionRejectAll) {
       return `[REJEITADO: ${filePath}]`;
     } else {
-      const ans = (await ask("Aceitar modificação? (y/n) [a = aceitar todas, r = rejeitar todas]: ")).trim().toLowerCase();
+      const ans = (await ask("Aceitar modificação? (y/n) [a = aceitar todas, r = rejeitar todas]: ", true)).trim().toLowerCase();
       if (ans === "a" || ans === "all" || ans === "accept_all") {
         sessionAcceptAll = true;
       }
@@ -396,7 +584,7 @@ async function writeFile(filePath: string, content: string): Promise<string> {
       const code = (e && (e as any).code) || "";
       if (code === "EACCES" || code === "EPERM") {
         console.error(`Erro ao escrever ${filePath}: ${(e as any).message}`);
-        const tryTemp = (await ask(`Permissão negada. Tentar salvar em pasta temporária (${os.tmpdir()})? (y/n): `)).trim().toLowerCase();
+        const tryTemp = (await ask(`Permissão negada. Tentar salvar em pasta temporária (${os.tmpdir()})? (y/n): `, true)).trim().toLowerCase();
         if (tryTemp === "y" || tryTemp === "yes") {
           try {
             const altResolved = path.join(os.tmpdir(), path.basename(filePath));
@@ -407,7 +595,7 @@ async function writeFile(filePath: string, content: string): Promise<string> {
           }
         }
 
-        const tryAlt = (await ask("Tentar caminho alternativo manual? (y/n): ")).trim().toLowerCase();
+        const tryAlt = (await ask("Tentar caminho alternativo manual? (y/n): ", true)).trim().toLowerCase();
         if (tryAlt === "y" || tryAlt === "yes") {
           const alt = (await ask("Forneça caminho alternativo (arquivo completo): ")).trim();
           if (!alt) return `[CANCELADO: sem caminho alternativo fornecido]`;
@@ -632,7 +820,7 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
     for (let i = 0; i < runCommandsBg.length; i++) {
       console.log(`  ${runCommands.length + i + 1}. ${runCommandsBg[i]?.command} (background)`);
     }
-    const ok = (await ask(`Executar na sequência? (y/n): `)).trim().toLowerCase();
+    const ok = (await ask(`Executar na sequência? (y/n): `, true)).trim().toLowerCase();
     if (ok === "y" || ok === "yes") {
       let cmdIndex = 1;
       
@@ -658,7 +846,7 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
         const procName = `bg-${Date.now()}-${i}`;
         const msg = startManagedProcess(procName, cmd, process.cwd());
         console.log(`${msg}`);
-        console.log(`Processo: ${procName}. Use /ps para listar, /kill ou /stop para parar.`);
+        console.log(`Processo: ${procName}. Use /ps para listar, /logs para ver saída, /kill ou /stop para parar.`);
         results.push(`[run_command_bg ${i + 1} iniciado: ${cmd} (${procName})]`);
         cmdIndex++;
       }
@@ -720,7 +908,7 @@ function loadSettings(): Record<string, any> {
   }
 }
 
-function saveSettings(updates: Record<string, any>): void {
+function saveSettings(updates: Record<string, any>): boolean {
   try {
     const p = getSettingsPath();
     const dir = path.dirname(p);
@@ -736,8 +924,10 @@ function saveSettings(updates: Record<string, any>): void {
     try {
       if (process.platform !== "win32") fs.chmodSync(p, 0o600);
     } catch {}
+    return true;
   } catch (e) {
     console.error("Erro ao gravar settings:", (e as any).message);
+    return false;
   }
 }
 
@@ -764,6 +954,7 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log("  /clear                 - limpa histórico");
   console.log("  /kill [nome]           - mata processo (sem confirmação, sem nome = ativo)");
   console.log("  /ps                    - lista processos gerenciados");
+  console.log("  /logs [nome] [linhas]  - mostra logs do processo (padrão: ativo, 80 linhas)");
   console.log("  /h, /help              - mostra esta ajuda");
   console.log("  sair                   - encerra\n");
 }
@@ -843,6 +1034,7 @@ async function chatWithModel(apiKey: string, model: string): Promise<string> {
   let stopSpinner = startSpinner(`⏳ Processando...`);
   
   try {
+    let planApproved = false;
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       let res: Response;
       try {
@@ -877,23 +1069,27 @@ async function chatWithModel(apiKey: string, model: string): Promise<string> {
       messages.push({ role: "assistant", content: assistantMsg });
       // Check for planning tags first
       const planMatch = assistantMsg.match(/<plan>([\s\S]*?)<\/plan>/);
-      if (planMatch && round === 0) {
-        // Found a plan on first round - show it and ask for approval
+      if (planMatch && !planApproved) {
+        // Found a plan - show it and ask for approval
         const plan = planMatch[1].trim();
         stopSpinner();
         console.log(`\n📋 PLANO:\n${plan}\n`);
         const approved = (await ask("Aceitar plano? (y/n/Enter para sim): ", true)).trim().toLowerCase();
-        
+
         if (approved !== "y" && approved !== "yes") {
           console.log("Plano rejeitado pelo usuário.");
           // Remove the assistant message and the user message that generated it
           messages.pop();
           return `Plano rejeitado. Pode descrever suas mudanças?`;
         }
-        
+
+        planApproved = true;
         console.log("✓ Plano aprovado. Executando...\n");
         stopSpinner = startSpinner(`⏳ Executando plano...`);
-        // Continue with tool execution
+        // inject user confirmation so model continues immediately with tool calls
+        messages.push({ role: "user", content: "Plano aprovado. Execute as ações descritas no plano." });
+        // continue loop to fetch assistant follow-up (which should contain tool calls)
+        continue;
       }
 
 
@@ -1064,11 +1260,12 @@ async function main() {
     // /model command: show list or set model
     if (input.startsWith("/model")) {
       const arg = input.slice(6).trim();
+      const models = getAllowedModelsList();
       if (!arg) {
         console.log(`Modelo atual: ${modelUsed}`);
         console.log("Modelos permitidos:");
-        for (const m of getAllowedModelsList()) console.log("  - " + m);
-        console.log("Use '/model <nome>' para trocar e salvar no settings do usuário");
+        models.forEach((m, i) => console.log(`  [${i + 1}] ${m}`));
+        console.log("Use '/model <nome>' ou '/model <número>' para trocar e salvar no settings do usuário");
         console.log("Use '/model add <nome>' para adicionar modelo aos permitidos\n");
         continue;
       }
@@ -1106,13 +1303,24 @@ async function main() {
         }
       }
 
-      if (!isModelAllowed(arg)) {
-        console.log(`Modelo não permitido: ${arg}`);
+      let chosenModel: string = arg;
+      if (/^\d+$/.test(arg)) {
+        const idx = parseInt(arg, 10) - 1;
+        if (idx >= 0 && idx < models.length) {
+          chosenModel = models[idx]!;
+        } else {
+          console.log(`Índice inválido: ${arg}`);
+          continue;
+        }
+      }
+
+      if (!isModelAllowed(chosenModel)) {
+        console.log(`Modelo não permitido: ${chosenModel}`);
         console.log("Ver modelos permitidos com '/model'\n");
         continue;
       }
 
-      modelUsed = arg;
+      modelUsed = chosenModel;
       saveSettings({ model: modelUsed });
       console.log(`Modelo alterado para: ${modelUsed} (salvo em settings do usuário)\n`);
       continue;
@@ -1164,22 +1372,33 @@ async function main() {
     // /url command: set or show API URL
     if (input.startsWith("/url")) {
       const arg = input.slice(4).trim();
+      const urlEntries = Object.entries(API_URL_DEFAULTS);
       if (!arg) {
         console.log(`URL da API atual: ${apiUrl}`);
         console.log("\nPresets disponíveis:");
-        for (const [name, url] of Object.entries(API_URL_DEFAULTS)) {
-          console.log(`  ${name.padEnd(12)} - ${url}`);
-        }
+        urlEntries.forEach(([name, url], i) => {
+          console.log(`  [${i + 1}] ${name.padEnd(12)} - ${url}`);
+        });
         console.log("\nUso:");
         console.log("  /url <preset>        - muda para um preset (openrouter, openai, anthropic, etc)");
+        console.log("  /url <número>        - muda para preset pelo índice");
         console.log("  /url https://...     - muda para URL customizada\n");
         continue;
       }
 
       let newUrl: string | undefined;
 
-      // Check if it's a preset
-      if (arg.toLowerCase() in API_URL_DEFAULTS) {
+      if (/^\d+$/.test(arg)) {
+        const idx = parseInt(arg, 10) - 1;
+        if (idx >= 0 && idx < urlEntries.length) {
+          const [presetName, presetUrl] = urlEntries[idx]!;
+          newUrl = presetUrl;
+          console.log(`✓ URL alterada para preset [${idx + 1}] '${presetName}': ${newUrl}`);
+        } else {
+          console.log(`Índice inválido: ${arg}`);
+          continue;
+        }
+      } else if (arg.toLowerCase() in API_URL_DEFAULTS) {
         newUrl = API_URL_DEFAULTS[arg.toLowerCase() as keyof typeof API_URL_DEFAULTS];
         console.log(`✓ URL alterada para preset '${arg.toLowerCase()}': ${newUrl}`);
       } else if (arg.startsWith("http://") || arg.startsWith("https://")) {
@@ -1246,7 +1465,7 @@ async function main() {
         console.log(`❌ Comando rejeitado: ${validation.reason}\n`);
         continue;
       }
-      const ok = (await ask(`Executar comando (projeto ${process.cwd()}): ${cmd} ? (y/n): `)).trim().toLowerCase();
+      const ok = (await ask(`Executar comando (projeto ${process.cwd()}): ${cmd} ? (y/n): `, true)).trim().toLowerCase();
       if (ok !== "y" && ok !== "yes") {
         console.log("Cancelado pelo usuário.\n");
         continue;
@@ -1269,19 +1488,32 @@ async function main() {
     // /start <nome> <comando> - inicia processo gerenciado
     if (input.startsWith("/start ")) {
       const rest = input.slice(7).trim();
-      const parts = rest.split(" ");
+      // Suporte a --fg para foreground
+      const fg = rest.includes("--fg");
+      const cleanRest = rest.replace(/--fg/g, "").trim();
+      const parts = cleanRest.split(" ");
       if (parts.length < 2) {
-        console.log("Uso: /start <nome> <comando>");
+        console.log("Uso: /start [--fg] <nome> <comando>");
         continue;
       }
       const name = parts.shift()!;
       const cmd = parts.join(" ");
-      const ok = (await ask(`Iniciar processo '${name}': ${cmd} ? (y/n): `)).trim().toLowerCase();
+      const ok = (await ask(`Iniciar processo '${name}'${fg ? " (foreground)" : ""}: ${cmd} ? (y/n): `, true)).trim().toLowerCase();
       if (ok !== "y" && ok !== "yes") {
         console.log("Cancelado pelo usuário.\n");
         continue;
       }
-      console.log(startManagedProcess(name, cmd, process.cwd()));
+      if (fg) {
+        // Foreground: trava terminal, mostra stdout/stderr ao vivo
+        try {
+          await runCommand(cmd, process.cwd());
+          console.log(`✓ Processo '${name}' (foreground) finalizado.`);
+        } catch (e: any) {
+          console.error(`Erro ao rodar processo foreground: ${(e && e.message) || e}`);
+        }
+      } else {
+        console.log(startManagedProcess(name, cmd, process.cwd()));
+      }
       continue;
     }
 
@@ -1293,7 +1525,7 @@ async function main() {
         console.log("[Nenhum processo ativo. Use /ps para listar.]\n");
         continue;
       }
-      const ok = (await ask(`Parar processo '${targetName}' ? (y/n): `)).trim().toLowerCase();
+      const ok = (await ask(`Parar processo '${targetName}' ? (y/n): `, true)).trim().toLowerCase();
       if (ok !== "y" && ok !== "yes") {
         console.log("Cancelado pelo usuário.\n");
         continue;
@@ -1322,6 +1554,29 @@ async function main() {
         console.log(`[Processo ativo: ${activeProcessName}]\n`);
       }
       console.log(listManaged() + "\n");
+      continue;
+    }
+
+    // /logs [nome] [linhas] - exibe logs de processo gerenciado
+    if (input === "/logs" || input.startsWith("/logs ")) {
+      const rest = input.slice(5).trim();
+      const parts = rest ? rest.split(/\s+/) : [];
+
+      let targetName: string | undefined;
+      let lineCount = 80;
+
+      if (parts.length === 1) {
+        const n = Number(parts[0]);
+        if (Number.isFinite(n)) lineCount = n;
+        else targetName = parts[0];
+      } else if (parts.length >= 2) {
+        targetName = parts[0];
+        const n = Number(parts[1]);
+        if (Number.isFinite(n)) lineCount = n;
+      }
+
+      const out = getManagedProcessLogs(targetName, lineCount);
+      console.log(out + "\n");
       continue;
     }
 
