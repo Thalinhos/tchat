@@ -433,6 +433,21 @@ function ask(prompt: string, acceptEmptyAsYes: boolean = false): Promise<string>
   });
 }
 
+async function confirm(message: string): Promise<boolean> {
+  const ans = (await ask(`⚠️  ${message} (y/N): `)).trim().toLowerCase();
+  return ans === "y" || ans === "yes";
+}
+
+/** Resolve name-or-index from a list. Returns the resolved name or null if invalid. */
+function resolveByNameOrIndex(input: string, list: string[]): string | null {
+  if (/^\d+$/.test(input)) {
+    const idx = parseInt(input, 10) - 1;
+    if (idx < 0 || idx >= list.length) return null;
+    return list[idx] ?? null;
+  }
+  return list.includes(input) ? input : null;
+}
+
 function updateSystemPromptWithCaveman(mode: CavemanLevel): void {
   let systemContent = SYSTEM_PROMPT;
   
@@ -968,8 +983,10 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log("  /accept [on|off]       - auto-aceitar modificações (padrão: perguntar)");
   console.log("  /reject [on|off]       - auto-rejeitar modificações (padrão: perguntar)");
   console.log("  /url [preset|url]      - mostra/troca URL da API (openrouter, openai, anthropic, etc)");
-  console.log("  /api_key [chave]       - define API key para esta sessão");
-  console.log("  /keys                  - gerencia múltiplas API Keys (listar/remover)");
+  console.log("  /api_key add <n> <k>   - armazena nova chave com nome <n>");
+  console.log("  /api_key use <nome>    - ativa chave armazenada pelo nome");
+  console.log("  /api_key all           - lista todas as chaves armazenadas");
+  console.log("  /api_key rm <nome>     - remove uma chave armazenada");
   console.log("  /clear                 - limpa histórico");
   console.log("  /run <cmd>             - executa comando com validação");
   console.log("  /start [--fg] <name> <cmd> - inicia processo gerenciado");
@@ -1221,6 +1238,17 @@ async function main() {
   }
 
   let finalApiKey = (parsed.apiKey || readEnvApiKey() || settings.apiKey || "").trim();
+  
+  // Try to load active API key from stored keys
+  if (!finalApiKey && settings.currentApiKeyName && settings.storedApiKeys) {
+    const activeKeyName = settings.currentApiKeyName;
+    const storedKey = settings.storedApiKeys[activeKeyName];
+    if (storedKey) {
+      finalApiKey = storedKey;
+      console.log(`ℹ Chave '${activeKeyName}' carregada automaticamente.\n`);
+    }
+  }
+  
   let modelUsed = (parsed.model || readEnvModel() || settings.model || DEFAULT_MODELS[0] || MODEL_DEFAULT).trim();
   let fallbackModel = settings.fallbackModel || FALLBACK_MODEL_DEFAULT;
   cavemanMode = settings.cavemanMode || "off";
@@ -1275,6 +1303,10 @@ async function main() {
     if (input.toLowerCase() === "sair") break;
 
     if (input === "/clear") {
+      if (!await confirm("Limpar todo o histórico de conversa?")) {
+        console.log("Cancelado.\n");
+        continue;
+      }
       messages.length = 1;
       console.log("Histórico limpo.\n");
       continue;
@@ -1339,14 +1371,21 @@ async function main() {
           continue;
         }
         if (cmd === "rm" || cmd === "remove") {
-          const idx = settings.allowedExtraModels.indexOf(name);
-          if (idx === -1) {
+          // support numeric index
+          const extraList: string[] = settings.allowedExtraModels;
+          const resolved = resolveByNameOrIndex(name, extraList);
+          if (!resolved) {
             console.log(`Modelo não encontrado entre extras: ${name}\n`);
             continue;
           }
-          settings.allowedExtraModels.splice(idx, 1);
-          saveSettings({ allowedExtraModels: settings.allowedExtraModels });
-          console.log(`Modelo removido da lista extra: ${name}\n`);
+          if (!await confirm(`Remover modelo '${resolved}' da lista?"`)) {
+            console.log("Cancelado.\n");
+            continue;
+          }
+          const idx2 = extraList.indexOf(resolved);
+          extraList.splice(idx2, 1);
+          saveSettings({ allowedExtraModels: extraList });
+          console.log(`Modelo removido da lista extra: ${resolved}\n`);
           continue;
         }
       }
@@ -1374,9 +1413,121 @@ async function main() {
       continue;
     }
 
-    // /api_key command: set current API key and save to settings
+    // /api_key command: manage stored API keys (add, use, all, rm)
     if (input.startsWith("/api_key")) {
       const arg = input.slice(8).trim();
+
+      // /api_key (sem args) → mostrar opções
+      if (!arg) {
+        const st = loadSettings();
+        const currentName = st.currentApiKeyName || "nenhuma";
+        console.log(`Chave ativa: ${currentName}`);
+        console.log("\nSubcomandos:");
+        console.log("  /api_key all           - lista nomes das chaves cadastradas");
+        console.log("  /api_key add <n> <key> - armazena nova chave com nome");
+        console.log("  /api_key use <nome>    - ativa uma chave pelo nome");
+        console.log("  /api_key rm <nome>     - remove uma chave\n");
+        continue;
+      }
+      
+      // /api_key all - listar apenas os nomes
+      if (arg === "all") {
+        const st = loadSettings();
+        const storedKeys = st.storedApiKeys || {};
+        const currentName = st.currentApiKeyName || "nenhuma";
+        const entries = Object.entries(storedKeys);
+
+        if (entries.length === 0) {
+          console.log("Nenhuma API Key armazenada. Use '/api_key add <nome> <chave>'\n");
+        } else {
+          console.log("=== API Keys Cadastradas ===");
+          entries.forEach(([name], i) => {
+            const activeMark = (currentName === name) ? " ✓" : "";
+            console.log(`  [${i + 1}] ${name}${activeMark}`);
+          });
+          console.log();
+        }
+        continue;
+      }
+      
+      // Handle /api_key rm <nome|id> - remove a stored key by name or numeric id
+      if (arg.startsWith("rm ")) {
+        let name = arg.slice(3).trim();
+        if (!name) {
+          console.log("Uso: /api_key rm <nome|id>\n");
+          continue;
+        }
+        const st = loadSettings();
+        const storedKeys = st.storedApiKeys || {};
+        const currentName = st.currentApiKeyName || "nenhuma";
+        const names = Object.keys(storedKeys);
+
+        const resolvedRm = resolveByNameOrIndex(name, names);
+        if (!resolvedRm) {
+          console.log(`❌ Chave '${name}' não encontrada.\n`);
+          continue;
+        }
+        name = resolvedRm;
+
+        if (!await confirm(`Remover chave '${name}'?`)) {
+          console.log("Cancelado.\n");
+          continue;
+        }
+        delete storedKeys[name];
+        if (currentName === name) {
+          saveSettings({ storedApiKeys: storedKeys, currentApiKeyName: null });
+        } else {
+          saveSettings({ storedApiKeys: storedKeys });
+        }
+        console.log(`✓ Chave '${name}' removida.\n`);
+        continue;
+      }
+      
+      // Handle /api_key add <nome> <chave> - add a new key
+      if (arg.startsWith("add ")) {
+        const parts = arg.slice(4).trim().split(/\s+/, 1);
+        const name = parts[0] ?? "";
+        const key = arg.slice(4).trim().substring(name.length).trim();
+        
+        if (!name || !key) {
+          console.log("Uso: /api_key add <nome> <chave>\n");
+          continue;
+        }
+        
+        const st = loadSettings();
+        const storedKeys = st.storedApiKeys || {};
+        storedKeys[name] = key;
+        saveSettings({ storedApiKeys: storedKeys });
+        console.log(`✓ Chave '${name}' adicionada e salva nas settings.\n`);
+        continue;
+      }
+      
+      // Handle /api_key use <nome|id> - activate a stored key by name or numeric id
+      if (arg.startsWith("use ")) {
+        let name = arg.slice(4).trim();
+        const st = loadSettings();
+        const storedKeys = st.storedApiKeys || {};
+        const names = Object.keys(storedKeys);
+
+        if (!name) {
+          console.log("Uso: /api_key use <nome|id>\n");
+          continue;
+        }
+
+        const resolvedUse = resolveByNameOrIndex(name, names);
+        if (!resolvedUse) {
+          console.log(`❌ Chave '${name}' não encontrada.\n`);
+          continue;
+        }
+        name = resolvedUse;
+
+        finalApiKey = storedKeys[name];
+        saveSettings({ currentApiKeyName: name });
+        console.log(`✓ Chave '${name}' selecionada e salva.\n`);
+        continue;
+      }
+
+      // Fallback: direct API key from command line
       let newKey = arg;
       if (!newKey) {
         newKey = (await ask("Insira nova API key: ")).trim();
@@ -1386,59 +1537,7 @@ async function main() {
         continue;
       }
       finalApiKey = newKey;
-      
-      // Update multi-key storage based on current URL domain
-      const keys = settings.apiKeys || {};
-      try {
-        const domain = new URL(apiUrl).hostname;
-        keys[domain] = finalApiKey;
-      } catch {
-        keys["default"] = finalApiKey;
-      }
-
-      try {
-        saveSettings({ apiKey: finalApiKey, apiKeys: keys });
-      } catch {}
-      console.log("API key atualizada e salva nas settings do usuário.\n");
-      continue;
-    }
-
-    // /keys command: list and manage stored API keys
-    if (input.startsWith("/keys")) {
-      const arg = input.slice(5).trim();
-      const st = loadSettings(); // reload to get latest
-      const keys = st.apiKeys || {};
-      const entries = Object.entries(keys);
-
-      if (arg.startsWith("rm ")) {
-        const toRem = arg.slice(3).trim();
-        if (keys[toRem]) {
-          delete keys[toRem];
-          saveSettings({ apiKeys: keys });
-          console.log(`✓ Chave para ${toRem} removida.\n`);
-        } else {
-          console.log(`❌ Chave para ${toRem} não encontrada.\n`);
-        }
-        continue;
-      }
-
-      if (entries.length === 0) {
-        console.log("Nenhuma API Key armazenada no momento.\n");
-      } else {
-        console.log("=== API Keys Armazenadas ===");
-        entries.forEach(([host, key], i) => {
-          const kStr = String(key);
-          const masked = kStr.length > 8 ? `${kStr.substring(0, 8)}...${kStr.substring(kStr.length - 4)}` : "***";
-          let activeMark = "";
-          try {
-            if (new URL(apiUrl).hostname === host) activeMark = " (ATIVA)";
-          } catch {}
-          console.log(`  [${i + 1}] ${host.padEnd(30)} : ${masked}${activeMark}`);
-        });
-        console.log("\nUso:");
-        console.log("  /keys rm <host>    - Remove uma chave específica");
-        console.log("  /api_key <key>     - Adiciona/Atualiza chave para o host atual\n");
-      }
+      console.log("API key carregada para esta sessão.\n");
       continue;
     }
 
@@ -1509,17 +1608,6 @@ async function main() {
 
       if (newUrl) {
         apiUrl = newUrl;
-        
-        // Auto-switch API key if one is stored for this host
-        try {
-          const host = new URL(apiUrl).hostname;
-          const st = loadSettings();
-          if (st.apiKeys && st.apiKeys[host]) {
-            finalApiKey = st.apiKeys[host];
-            console.log(`ℹ API Key detectada para ${host} e configurada automaticamente.`);
-          }
-        } catch {}
-
         saveSettings({ apiUrl: newUrl });
         console.log("(salvo em settings do usuário)\n");
       }
