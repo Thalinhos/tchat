@@ -83,6 +83,7 @@ const API_URL_DEFAULTS = {
   groq: "https://api.groq.com/openai/v1/chat/completions",
   deepseek: "https://api.deepseek.com/v1/chat/completions",
   nvidia: "https://integrate.api.nvidia.com/v1/chat/completions", //currently not working well
+  google: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
 };
 
 const MODEL_DEFAULT = "z-ai/glm-4.5-air:free";
@@ -97,6 +98,11 @@ const ALLOWED_MODELS = [
   "anthropic/claude-sonnet-4.6",
   "anthropic/claude-opus-4.7",
   "qwen/qwen3.6-plus",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite-preview-02-05",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-1.5-flash-8b",
 ];
 const MAX_TOOL_ROUNDS = 20;
 const MAX_RETRIES = 2; // Número máximo de retries com fallback
@@ -963,6 +969,7 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log("  /reject [on|off]       - auto-rejeitar modificações (padrão: perguntar)");
   console.log("  /url [preset|url]      - mostra/troca URL da API (openrouter, openai, anthropic, etc)");
   console.log("  /api_key [chave]       - define API key para esta sessão");
+  console.log("  /keys                  - gerencia múltiplas API Keys (listar/remover)");
   console.log("  /clear                 - limpa histórico");
   console.log("  /run <cmd>             - executa comando com validação");
   console.log("  /start [--fg] <name> <cmd> - inicia processo gerenciado");
@@ -1196,7 +1203,7 @@ async function main() {
   }
 
   function readEnvApiKey(): string | undefined {
-    const names = ["API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "THCHAT_API_KEY"];
+    const names = ["API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "THCHAT_API_KEY", "GOOGLE_API_KEY"];
     for (const n of names) {
       const v = process.env[n];
       if (v && v.trim()) return v.trim();
@@ -1367,7 +1374,7 @@ async function main() {
       continue;
     }
 
-    // /api_key command: set or show
+    // /api_key command: set current API key and save to settings
     if (input.startsWith("/api_key")) {
       const arg = input.slice(8).trim();
       let newKey = arg;
@@ -1379,11 +1386,59 @@ async function main() {
         continue;
       }
       finalApiKey = newKey;
-      // persist to user settings
+      
+      // Update multi-key storage based on current URL domain
+      const keys = settings.apiKeys || {};
       try {
-        saveSettings({ apiKey: finalApiKey });
+        const domain = new URL(apiUrl).hostname;
+        keys[domain] = finalApiKey;
+      } catch {
+        keys["default"] = finalApiKey;
+      }
+
+      try {
+        saveSettings({ apiKey: finalApiKey, apiKeys: keys });
       } catch {}
       console.log("API key atualizada e salva nas settings do usuário.\n");
+      continue;
+    }
+
+    // /keys command: list and manage stored API keys
+    if (input.startsWith("/keys")) {
+      const arg = input.slice(5).trim();
+      const st = loadSettings(); // reload to get latest
+      const keys = st.apiKeys || {};
+      const entries = Object.entries(keys);
+
+      if (arg.startsWith("rm ")) {
+        const toRem = arg.slice(3).trim();
+        if (keys[toRem]) {
+          delete keys[toRem];
+          saveSettings({ apiKeys: keys });
+          console.log(`✓ Chave para ${toRem} removida.\n`);
+        } else {
+          console.log(`❌ Chave para ${toRem} não encontrada.\n`);
+        }
+        continue;
+      }
+
+      if (entries.length === 0) {
+        console.log("Nenhuma API Key armazenada no momento.\n");
+      } else {
+        console.log("=== API Keys Armazenadas ===");
+        entries.forEach(([host, key], i) => {
+          const kStr = String(key);
+          const masked = kStr.length > 8 ? `${kStr.substring(0, 8)}...${kStr.substring(kStr.length - 4)}` : "***";
+          let activeMark = "";
+          try {
+            if (new URL(apiUrl).hostname === host) activeMark = " (ATIVA)";
+          } catch {}
+          console.log(`  [${i + 1}] ${host.padEnd(30)} : ${masked}${activeMark}`);
+        });
+        console.log("\nUso:");
+        console.log("  /keys rm <host>    - Remove uma chave específica");
+        console.log("  /api_key <key>     - Adiciona/Atualiza chave para o host atual\n");
+      }
       continue;
     }
 
@@ -1454,6 +1509,17 @@ async function main() {
 
       if (newUrl) {
         apiUrl = newUrl;
+        
+        // Auto-switch API key if one is stored for this host
+        try {
+          const host = new URL(apiUrl).hostname;
+          const st = loadSettings();
+          if (st.apiKeys && st.apiKeys[host]) {
+            finalApiKey = st.apiKeys[host];
+            console.log(`ℹ API Key detectada para ${host} e configurada automaticamente.`);
+          }
+        } catch {}
+
         saveSettings({ apiUrl: newUrl });
         console.log("(salvo em settings do usuário)\n");
       }
