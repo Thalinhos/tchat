@@ -185,14 +185,33 @@ function clearSpinner() {
 }
 
 // --- Process management ---
-function runCommand(cmd: string, cwd?: string): Promise<void> {
+function runCommand(cmd: string, cwd?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
     try {
-      const ps = spawn(cmd, { shell: true, cwd, stdio: "inherit" });
+      const ps = spawn(cmd, { shell: true, cwd });
+      let stdout = "";
+      let stderr = "";
+
+      if (ps.stdout) {
+        ps.stdout.on("data", (chunk) => {
+          const s = String(chunk);
+          stdout += s;
+          try { process.stdout.write(s); } catch {}
+        });
+      }
+      if (ps.stderr) {
+        ps.stderr.on("data", (chunk) => {
+          const s = String(chunk);
+          stderr += s;
+          try { process.stderr.write(s); } catch {}
+        });
+      }
+
       ps.on("error", (err) => reject(new CommandExecutionError(`Erro ao executar: ${(err as any).message}`)));
       ps.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new CommandExecutionError(`Comando falhou com exit code ${code}`, code ?? undefined));
+        const exitCode = typeof code === "number" ? code : 0;
+        if (exitCode === 0) resolve({ stdout, stderr, exitCode });
+        else reject(new CommandExecutionError(`Comando falhou com exit code ${exitCode}`, exitCode));
       });
     } catch (err: any) {
       reject(new CommandExecutionError(`Erro ao iniciar processo: ${err.message}`));
@@ -208,6 +227,8 @@ const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
 let sessionAcceptAll = false;
 let sessionRejectAll = false;
 let cavemanMode: CavemanLevel = "off";
+// current working directory tracked and sent to system prompt
+let currentCwd = process.cwd();
 let apiUrl = API_URL_DEFAULTS.openrouter;
 
 // Context map: keep file contents for reuse across messages
@@ -249,16 +270,17 @@ function resolveByNameOrIndex(input: string, list: string[]): string | null {
 }
 
 function updateSystemPromptWithCaveman(mode: CavemanLevel): void {
-  let systemContent = SYSTEM_PROMPT;
-  
+  // Ensure system prompt always contains current working directory
+  let systemContent = SYSTEM_PROMPT.replace(/Diretório de trabalho: .*/, `Diretório de trabalho: ${currentCwd}`);
+
   // Remove existing caveman instruction if present
   systemContent = systemContent.replace(/## Caveman Mode:[\s\S]*?(?=\n---|\n\n|$)/, "").trim();
-  
+
   // Add new caveman instruction if not "off"
   if (mode !== "off" && CAVEMAN_INSTRUCTIONS[mode]) {
     systemContent += "\n\n" + CAVEMAN_INSTRUCTIONS[mode];
   }
-  
+
   messages[0] = { role: "system", content: systemContent };
 }
 
@@ -630,12 +652,14 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
         const cmd = runCommands[i]?.command ?? "";
         console.log(`\n[${i + 1}/${totalCmds}] Executando (síncrono): ${cmd}`);
         try {
-          await runCommand(cmd, process.cwd());
+          const res = await runCommand(cmd, process.cwd());
           console.log(`✓ Comando finalizado com sucesso.`);
-          results.push(`[run_command ${i + 1} concluído: ${cmd}]`);
+          const out = `[run_command ${i + 1} output: ${cmd}]\n${res.stdout}${res.stderr ? `\n[stderr]\n${res.stderr}` : ""}`;
+          results.push(out);
         } catch (e: any) {
           console.error(`✗ Erro: ${e.message}`);
-          results.push(`[run_command ${i + 1} falhou: ${cmd} - ${e.message}]`);
+          const errOut = `[run_command ${i + 1} falhou: ${cmd}]\n${e.message}`;
+          results.push(errOut);
         }
       }
     } else {
@@ -719,10 +743,10 @@ function saveSettings(updates: Record<string, any>): boolean {
 function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log(`\nModelo: ${modelUsed}`);
   console.log(`Fallback: ${fallbackModel || "nenhum"}`);
+  console.log(`URL API: ${apiUrl}`);
   console.log(`Caveman: ${cavemanMode !== "off" ? cavemanMode.toUpperCase() : "off"}`);
   console.log(`Modificações: ${sessionAcceptAll ? "aceitar todas" : sessionRejectAll ? "rejeitar todas" : "perguntar"}`);
-  console.log(`URL API: ${apiUrl}`);
-  console.log(`Diretório: ${process.cwd()}`);
+  console.log(`Diretório: ${currentCwd}`);
   console.log("\nRecursos:");
   console.log("  - Arquivos mencionados são anexados automaticamente");
   console.log("  - O assistente pode ler, buscar e editar seus arquivos");
@@ -742,7 +766,8 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log("  /api_key use <nome>    - ativa chave armazenada pelo nome");
   console.log("  /api_key all           - lista todas as chaves armazenadas");
   console.log("  /api_key rm <nome>     - remove uma chave armazenada");
-  console.log("  /clear                 - limpa histórico");
+  console.log("  /reset                 - apaga TODAS as configurações (irrecuperável!)");
+  console.log("  /clear                 - limpa histórico de conversa");
   console.log("  /run <cmd>             - executa comando com validação");
   console.log("  /h, /help              - mostra esta ajuda");
   console.log("  sair                   - encerra\n");
@@ -1004,6 +1029,7 @@ async function main() {
   cavemanMode = settings.cavemanMode || "off";
   apiUrl = settings.apiUrl || API_URL_DEFAULTS.openrouter;
 
+
   // Restore session preferences
   sessionAcceptAll = settings.sessionAcceptAll || false;
   sessionRejectAll = settings.sessionRejectAll || false;
@@ -1071,6 +1097,36 @@ async function main() {
 
     if (input.toLowerCase() === "sair") break;
 
+    if (input === "/reset") {
+      if (!await confirm("⚠️  APAGAR TUDO? Isso vai deletar TODAS as suas chaves, modelos, URLs e configurações (irrecuperável!)")) {
+        console.log("Cancelado.\n");
+        continue;
+      }
+      try {
+        const settingsPath = getSettingsPath();
+        if (fs.existsSync(settingsPath)) {
+          fs.unlinkSync(settingsPath);
+          console.log("✓ Arquivo de configurações deletado.");
+        }
+        // Reset all in-memory settings
+        modelUsed = DEFAULT_MODELS[0] || MODEL_DEFAULT;
+        fallbackModel = FALLBACK_MODEL_DEFAULT;
+        cavemanMode = "off";
+        apiUrl = API_URL_DEFAULTS.openrouter;
+        sessionAcceptAll = false;
+        sessionRejectAll = false;
+        finalApiKey = "";
+        messages.length = 1;
+        currentCwd = process.cwd();
+        updateSystemPromptWithCaveman("off");
+        console.log("✓ Todas as configurações foram resetadas.");
+        console.log("⚠️  Reinicie o app para começar do zero.\n");
+      } catch (e: any) {
+        console.error(`Erro ao resetar: ${(e as any).message}\n`);
+      }
+      continue;
+    }
+
     if (input === "/clear") {
       if (!await confirm("Limpar todo o histórico de conversa?")) {
         console.log("Cancelado.\n");
@@ -1097,9 +1153,10 @@ async function main() {
       const dir = input.slice(4).trim();
       try {
         process.chdir(dir);
-        console.log(`Diretório: ${process.cwd()}\n`);
-        // Update system prompt with new cwd
-        messages[0] = { role: "system", content: SYSTEM_PROMPT.replace(/Diretório de trabalho: .*/, `Diretório de trabalho: ${process.cwd()}`) };
+        currentCwd = process.cwd();
+        console.log(`Diretório: ${currentCwd}\n`);
+        // Update system prompt with new cwd and keep caveman mode
+        updateSystemPromptWithCaveman(cavemanMode);
       } catch {
         console.log(`Diretório não encontrado: ${dir}\n`);
       }
@@ -1479,8 +1536,10 @@ async function main() {
         continue;
       }
       try {
-        await runCommand(cmd, process.cwd());
+        const res = await runCommand(cmd, process.cwd());
         console.log(`✓ Comando '${cmd}' finalizado.\n`);
+        // attach output to conversation history so AI can see results
+        messages.push({ role: "user", content: `[run_command manual] ${cmd}\n\nOutput:\n${res.stdout}${res.stderr ? `\n[stderr]\n${res.stderr}` : ""}` });
       } catch (e: any) {
         if (e instanceof CommandExecutionError) {
           console.error(`❌ Erro na execução: ${e.message}`);
