@@ -2,7 +2,7 @@ import * as readline from "readline";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 
 // --- Error handling ---
 class AppError extends Error {
@@ -141,9 +141,19 @@ Maximum compression. Telegraphic. Abbreviate everything.
 
 type CavemanLevel = "off" | "lite" | "full" | "ultra";
 
+const PLATFORM_LABEL =
+  process.platform === "win32"
+    ? "Windows (win32)"
+    : process.platform === "darwin"
+      ? "macOS (darwin)"
+      : process.platform === "linux"
+        ? "Linux"
+        : process.platform;
+
 const SYSTEM_PROMPT = `Você é um assistente de programação com acesso a ferramentas para ler e editar arquivos.
 
 Diretório de trabalho: ${process.cwd()}
+Plataforma do usuário: ${PLATFORM_LABEL}
 
 ## MODO PLANEJAMENTO OBRIGATÓRIO
 Antes de executar tarefas complexas:
@@ -152,8 +162,8 @@ Antes de executar tarefas complexas:
 3. Execute ferramentas apenas após aprovação
 
 ## Ferramentas: <read_file>path</read_file>, <list_dir>path</list_dir>, <search_files>pattern</search_files>, <write_file path="p">content</write_file>
-Para comandos: <run_command>cmd</run_command> (sync) ou <run_command_bg>cmd</run_command_bg> (bg)
-REGRA: npm start e npm run dev = <run_command_bg>!
+Para comandos: <run_command>cmd</run_command> (sync)
+REGRA: sempre execute comando em foreground no terminal visível. Nunca use background.
 Responda em português`;
 
 const rl = readline.createInterface({
@@ -175,84 +185,6 @@ function clearSpinner() {
 }
 
 // --- Process management ---
-type ManagedProc = {
-  name: string;
-  cmd: string;
-  cwd?: string;
-  proc: ReturnType<typeof spawn>;
-  logPath: string;
-  logStream: fs.WriteStream;
-};
-
-const managedProcesses = new Map<string, ManagedProc>();
-const managedProcessLogs = new Map<string, string>();
-let activeProcessName: string | null = null; // Rastreia processo ativo (último iniciado)
-const BG_LOG_DIR = path.join(os.tmpdir(), "thchat-bg-logs");
-
-function cleanupManagedProcess(name: string, exitCode?: number | null) {
-  const managed = managedProcesses.get(name);
-  if (!managed) return;
-
-  managedProcesses.delete(name);
-  if (activeProcessName === name) activeProcessName = null;
-
-  try {
-    managed.logStream.write(`\n[${new Date().toISOString()}] EXIT ${exitCode ?? "unknown"}\n`);
-    managed.logStream.end();
-  } catch {}
-}
-
-function getTailLines(content: string, lineCount: number): string {
-  const lines = content.split(/\r?\n/);
-  return lines.slice(Math.max(0, lines.length - lineCount)).join("\n");
-}
-
-function readLogTail(filePath: string, lineCount: number): string {
-  try {
-    const stat = fs.statSync(filePath);
-    const readSize = 64 * 1024; // 64KB
-    let pos = stat.size;
-    let buffer = Buffer.alloc(0);
-    const maxRead = 1024 * 1024; // cap total read to 1MB
-
-    const fd = fs.openSync(filePath, "r");
-    try {
-      while (pos > 0 && buffer.length < maxRead) {
-        const toRead = Math.min(readSize, pos);
-        const start = pos - toRead;
-        const chunk = Buffer.alloc(toRead);
-        fs.readSync(fd, chunk, 0, toRead, start);
-        buffer = Buffer.concat([chunk, buffer]);
-        pos -= toRead;
-
-        // quick check: if we have enough lines, stop
-        const lines = buffer.toString("utf8").split(/\r?\n/);
-        if (lines.length > lineCount + 1) break;
-      }
-    } finally {
-      try { fs.closeSync(fd); } catch {}
-    }
-
-    const chunk = buffer.toString("utf8");
-    return getTailLines(chunk, lineCount);
-  } catch (e: any) {
-    return `[ERRO ao ler logs: ${e.message}]`;
-  }
-}
-
-function getManagedProcessLogs(nameOrActive?: string, lineCount: number = 80): string {
-  const name = nameOrActive || activeProcessName;
-  if (!name) return "[ERRO: nenhum processo ativo ou nome especificado]";
-
-  const logPath = managedProcessLogs.get(name);
-  if (!logPath) return `[ERRO: logs do processo '${name}' não encontrados]`;
-  if (!fs.existsSync(logPath)) return `[ERRO: arquivo de log não existe: ${logPath}]`;
-
-  const safeLineCount = Number.isFinite(lineCount) && lineCount > 0 ? Math.min(500, Math.floor(lineCount)) : 80;
-  const tail = readLogTail(logPath, safeLineCount);
-  return `[logs: ${name} | últimas ${safeLineCount} linhas | ${logPath}]\n${tail}`;
-}
-
 function runCommand(cmd: string, cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     try {
@@ -266,138 +198,6 @@ function runCommand(cmd: string, cwd?: string): Promise<void> {
       reject(new CommandExecutionError(`Erro ao iniciar processo: ${err.message}`));
     }
   });
-}
-
-function startManagedProcess(name: string, cmd: string, cwd?: string): string {
-  if (managedProcesses.has(name)) return `[ERRO: processo '${name}' já existe]`;
-  try {
-    try {
-      fs.mkdirSync(BG_LOG_DIR, { recursive: true });
-    } catch {}
-
-    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const logPath = path.join(BG_LOG_DIR, `${Date.now()}-${safeName}.log`);
-    const logStream = fs.createWriteStream(logPath, { flags: "a", encoding: "utf8" });
-    logStream.write(`[${new Date().toISOString()}] START ${cmd} (cwd=${cwd || process.cwd()})\n`);
-
-    // Background process must not share terminal stdin. Output goes to log file.
-    const detached = process.platform !== "win32";
-    const ps = spawn(cmd, {
-      shell: true,
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      detached,
-    });
-    if (detached) {
-      try {
-        ps.unref();
-      } catch {}
-    }
-
-    ps.stdout?.on("data", (chunk) => {
-      try {
-        logStream.write(chunk);
-      } catch {}
-    });
-    ps.stderr?.on("data", (chunk) => {
-      try {
-        logStream.write(chunk);
-      } catch {}
-    });
-    ps.on("error", (err) => {
-      try {
-        logStream.write(`\n[${new Date().toISOString()}] ERROR ${(err as any).message}\n`);
-      } catch {}
-    });
-
-    const m: ManagedProc = { name, cmd, cwd, proc: ps, logPath, logStream };
-    managedProcesses.set(name, m);
-    managedProcessLogs.set(name, logPath);
-    activeProcessName = name; // Define como ativo
-    ps.on("close", (code) => {
-      cleanupManagedProcess(name, code);
-      try {
-        process.stdout.write(`\n[process ${name} exited ${code}]\n`);
-      } catch {}
-    });
-    return `[OK: processo '${name}' iniciado | logs: ${logPath}]`;
-  } catch (e: any) {
-    return `[ERRO ao iniciar '${name}': ${e.message}]`;
-  }
-}
-
-async function stopManagedProcess(nameOrActive?: string): Promise<string> {
-  // Se não passou nome, usa o ativo
-  let name = nameOrActive || activeProcessName;
-  if (!name) return `[ERRO: nenhum processo ativo ou especificado]`;
-  
-  const m = managedProcesses.get(name);
-  if (!m) return `[ERRO: processo '${name}' não encontrado]`;
-  try {
-    if (m.proc.exitCode !== null) {
-      cleanupManagedProcess(name, m.proc.exitCode);
-      return `[OK: processo '${name}' já estava finalizado]`;
-    }
-
-    const waitForClose = new Promise<number | null>((resolve) => {
-      m.proc.once("close", (code) => resolve(code));
-    });
-
-    // try graceful (platform-specific): kill process tree on Windows, kill process group on POSIX
-    const pid = m.proc.pid;
-    try {
-      if (pid) {
-        if (process.platform === "win32") {
-          try {
-            spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"]);
-          } catch {}
-        } else {
-          try {
-            process.kill(-pid, "SIGTERM");
-          } catch {}
-        }
-      }
-    } catch {}
-    let closeCode = await Promise.race<number | null | "timeout">(([
-      waitForClose,
-      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1200)),
-    ] as const));
-
-    if (closeCode === "timeout" && managedProcesses.has(name)) {
-      try {
-        if (pid) {
-          if (process.platform === "win32") {
-            try {
-              spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"]);
-            } catch {}
-          } else {
-            try {
-              process.kill(-pid, "SIGKILL");
-            } catch {}
-          }
-        }
-      } catch {}
-      closeCode = await Promise.race<number | null | "timeout">(([
-        waitForClose,
-        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1200)),
-      ] as const));
-    }
-
-    if (managedProcesses.has(name)) {
-      cleanupManagedProcess(name, closeCode === "timeout" ? null : closeCode);
-    }
-    return `[OK: processo '${name}' finalizado]`;
-  } catch (e: any) {
-    return `[ERRO ao parar '${name}': ${e.message}]`;
-  }
-}
-
-function listManaged(): string {
-  if (managedProcesses.size === 0) return "[Nenhum processo gerenciado ativo]";
-  return Array.from(managedProcesses.values())
-    .map((m) => `- ${m.name}: ${m.cmd} ${m.cwd ? `(${m.cwd})` : ""}`)
-    .join("\n");
 }
 
 const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
@@ -753,7 +553,7 @@ async function searchFilesAsync(pattern: string): Promise<string> {
 // --- Parse tool calls from AI response ---
 
 interface ToolCall {
-  type: "read_file" | "write_file" | "list_dir" | "search_files" | "run_command" | "run_command_bg";
+  type: "read_file" | "write_file" | "list_dir" | "search_files" | "run_command";
   path?: string;
   content?: string;
   pattern?: string;
@@ -807,29 +607,7 @@ function parseToolCalls(text: string): { calls: ToolCall[]; cleaned: string } {
   }
   cleaned = cleaned.replace(runCmdRegex, "");
 
-  // Parse <run_command_bg>comando</run_command_bg>
-  const runCmdBgRegex = /<run_command_bg>([\s\S]*?)<\/run_command_bg>/g;
-  while ((match = runCmdBgRegex.exec(text)) !== null) {
-    if (match[1]) calls.push({ type: "run_command_bg", command: match[1].trim(), raw: match[0] });
-  }
-  cleaned = cleaned.replace(runCmdBgRegex, "");
-
-  // Auto-correct: se <run_command> contém comandos que devem ser background, converter
-  const bgPatterns = ["npm start", "npm run dev", "npm run watch", "npm run server", "nodemon", "bun run dev"];
-  const normalizedCalls = calls.map((call) => {
-    if (call.type === "run_command") {
-      const cmd = call.command || "";
-      for (const pattern of bgPatterns) {
-        if (cmd.includes(pattern)) {
-          console.warn(`⚠️  Auto-correção: "${cmd}" deve ser background, convertendo para <run_command_bg>`);
-          return { ...call, type: "run_command_bg" as const };
-        }
-      }
-    }
-    return call;
-  }) as ToolCall[];
-
-  return { calls: normalizedCalls, cleaned: cleaned.trim() };
+  return { calls, cleaned: cleaned.trim() };
 }
 
 async function executeToolCalls(calls: ToolCall[]): Promise<string> {
@@ -837,27 +615,20 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
 
   // Separar comandos do resto
   const runCommands = calls.filter((c) => c.type === "run_command");
-  const runCommandsBg = calls.filter((c) => c.type === "run_command_bg");
-  const otherCalls = calls.filter((c) => c.type !== "run_command" && c.type !== "run_command_bg");
+  const otherCalls = calls.filter((c) => c.type !== "run_command");
 
-  // Processar run_command e run_command_bg juntos com uma única confirmação
-  if (runCommands.length > 0 || runCommandsBg.length > 0) {
-    const totalCmds = runCommands.length + runCommandsBg.length;
+  // Processar run_command com uma única confirmação
+  if (runCommands.length > 0) {
+    const totalCmds = runCommands.length;
     console.log(`\n[IA quer executar ${totalCmds} comando(s)]:`);
     for (let i = 0; i < runCommands.length; i++) {
       console.log(`  ${i + 1}. ${runCommands[i]?.command} (síncrono)`);
     }
-    for (let i = 0; i < runCommandsBg.length; i++) {
-      console.log(`  ${runCommands.length + i + 1}. ${runCommandsBg[i]?.command} (background)`);
-    }
     const ok = (await ask(`Executar na sequência? (y/n): `, true)).trim().toLowerCase();
     if (ok === "y" || ok === "yes") {
-      let cmdIndex = 1;
-      
-      // Executar run_command (síncrono)
       for (let i = 0; i < runCommands.length; i++) {
         const cmd = runCommands[i]?.command ?? "";
-        console.log(`\n[${cmdIndex}/${totalCmds}] Executando (síncrono): ${cmd}`);
+        console.log(`\n[${i + 1}/${totalCmds}] Executando (síncrono): ${cmd}`);
         try {
           await runCommand(cmd, process.cwd());
           console.log(`✓ Comando finalizado com sucesso.`);
@@ -866,27 +637,11 @@ async function executeToolCalls(calls: ToolCall[]): Promise<string> {
           console.error(`✗ Erro: ${e.message}`);
           results.push(`[run_command ${i + 1} falhou: ${cmd} - ${e.message}]`);
         }
-        cmdIndex++;
-      }
-
-      // Executar run_command_bg (background)
-      for (let i = 0; i < runCommandsBg.length; i++) {
-        const cmd = runCommandsBg[i]?.command ?? "";
-        console.log(`\n[${cmdIndex}/${totalCmds}] Iniciando em background: ${cmd}`);
-        const procName = `bg-${Date.now()}-${i}`;
-        const msg = startManagedProcess(procName, cmd, process.cwd());
-        console.log(`${msg}`);
-        console.log(`Processo: ${procName}. Use /ps para listar, /logs para ver saída, /kill ou /stop para parar.`);
-        results.push(`[run_command_bg ${i + 1} iniciado: ${cmd} (${procName})]`);
-        cmdIndex++;
       }
     } else {
       console.log("Comandos cancelados pelo usuário.\n");
       for (let i = 0; i < runCommands.length; i++) {
         results.push(`[run_command ${i + 1} cancelado: ${runCommands[i]?.command}]`);
-      }
-      for (let i = 0; i < runCommandsBg.length; i++) {
-        results.push(`[run_command_bg ${i + 1} cancelado: ${runCommandsBg[i]?.command}]`);
       }
     }
   }
@@ -989,11 +744,6 @@ function printHelp(modelUsed: string, fallbackModel?: string) {
   console.log("  /api_key rm <nome>     - remove uma chave armazenada");
   console.log("  /clear                 - limpa histórico");
   console.log("  /run <cmd>             - executa comando com validação");
-  console.log("  /start [--fg] <name> <cmd> - inicia processo gerenciado");
-  console.log("  /stop [nome]           - para processo (com confirmação)");
-  console.log("  /kill [nome]           - mata processo (sem confirmação)");
-  console.log("  /ps                    - lista processos gerenciados");
-  console.log("  /logs [nome] [linhas]  - mostra logs do processo (padrão: ativo, 80 linhas)");
   console.log("  /h, /help              - mostra esta ajuda");
   console.log("  sair                   - encerra\n");
 }
@@ -1254,6 +1004,10 @@ async function main() {
   cavemanMode = settings.cavemanMode || "off";
   apiUrl = settings.apiUrl || API_URL_DEFAULTS.openrouter;
 
+  // Restore session preferences
+  sessionAcceptAll = settings.sessionAcceptAll || false;
+  sessionRejectAll = settings.sessionRejectAll || false;
+
   // Restore caveman mode in system prompt if it was saved
   if (cavemanMode !== "off") {
     updateSystemPromptWithCaveman(cavemanMode);
@@ -1269,14 +1023,29 @@ async function main() {
     }
     finalApiKey = askKey;
     askedApiKey = true;
-    // persist API key to user settings
+    // persist API key to user settings: save in both apiKey (legacy) and storedApiKeys (new multi-key system)
     try {
-      saveSettings({ apiKey: finalApiKey });
+      const storedKeys = settings.storedApiKeys || {};
+      storedKeys.openrouter = finalApiKey;
+      saveSettings({ 
+        apiKey: finalApiKey, 
+        storedApiKeys: storedKeys,
+        currentApiKeyName: "openrouter"
+      });
+      console.log("✓ API key salva em settings (pode ser alterada com /api_key depois)\n");
     } catch {}
   } else {
     // if we obtained apiKey from parsed/env/settings and it's new, persist to settings
     try {
-      if (settings.apiKey !== finalApiKey) saveSettings({ apiKey: finalApiKey });
+      if (settings.apiKey !== finalApiKey) {
+        const storedKeys = settings.storedApiKeys || {};
+        storedKeys.openrouter = finalApiKey;
+        saveSettings({ 
+          apiKey: finalApiKey,
+          storedApiKeys: storedKeys,
+          currentApiKeyName: "openrouter"
+        });
+      }
     } catch {}
   }
 
@@ -1423,10 +1192,15 @@ async function main() {
         const currentName = st.currentApiKeyName || "nenhuma";
         console.log(`Chave ativa: ${currentName}`);
         console.log("\nSubcomandos:");
-        console.log("  /api_key all           - lista nomes das chaves cadastradas");
-        console.log("  /api_key add <n> <key> - armazena nova chave com nome");
-        console.log("  /api_key use <nome>    - ativa uma chave pelo nome");
-        console.log("  /api_key rm <nome>     - remove uma chave\n");
+        console.log("  /api_key all           - lista TODAS as chaves cadastradas (com índices)");
+        console.log("  /api_key add <n> <key> - armazena nova chave com nome <n>");
+        console.log("  /api_key use <nome|id> - ativa chave pelo NOME ou ÍNDICE [1,2,3...]");
+        console.log("  /api_key rm <nome|id>  - remove chave pelo NOME ou ÍNDICE");
+        console.log("\nExemplos:");
+        console.log("  /api_key add openrouter sk-abcd1234...");
+        console.log("  /api_key all");
+        console.log("  /api_key use openrouter     (ativa pelo nome)");
+        console.log("  /api_key use 1              (ativa pela posição)\n");
         continue;
       }
       
@@ -1511,19 +1285,22 @@ async function main() {
 
         if (!name) {
           console.log("Uso: /api_key use <nome|id>\n");
+          console.log("Exemplos:");
+          console.log("  /api_key use openrouter   (por nome)");
+          console.log("  /api_key use 1            (por índice)\n");
           continue;
         }
 
         const resolvedUse = resolveByNameOrIndex(name, names);
         if (!resolvedUse) {
-          console.log(`❌ Chave '${name}' não encontrada.\n`);
+          console.log(`❌ Chave '${name}' não encontrada (use /api_key all para ver lista).\n`);
           continue;
         }
         name = resolvedUse;
 
         finalApiKey = storedKeys[name];
         saveSettings({ currentApiKeyName: name });
-        console.log(`✓ Chave '${name}' selecionada e salva.\n`);
+        console.log(`✓ Chave '${name}' selecionada e salva na sessão atual.\n`);
         continue;
       }
 
@@ -1620,10 +1397,12 @@ async function main() {
       if (!arg || arg === "on") {
         sessionAcceptAll = true;
         sessionRejectAll = false;
-        console.log(`✓ Modo: aceitar todas as modificações automaticamente\n`);
+        saveSettings({ sessionAcceptAll: true, sessionRejectAll: false });
+        console.log(`✓ Modo: aceitar todas as modificações automaticamente (salvo em settings)\n`);
       } else if (arg === "off") {
         sessionAcceptAll = false;
-        console.log(`✓ Modo: perguntar antes de cada modificação\n`);
+        saveSettings({ sessionAcceptAll: false });
+        console.log(`✓ Modo: perguntar antes de cada modificação (salvo em settings)\n`);
       } else {
         console.log("Uso: /accept [on|off]\n");
       }
@@ -1636,10 +1415,12 @@ async function main() {
       if (!arg || arg === "on") {
         sessionRejectAll = true;
         sessionAcceptAll = false;
-        console.log(`✓ Modo: rejeitar todas as modificações automaticamente\n`);
+        saveSettings({ sessionRejectAll: true, sessionAcceptAll: false });
+        console.log(`✓ Modo: rejeitar todas as modificações automaticamente (salvo em settings)\n`);
       } else if (arg === "off") {
         sessionRejectAll = false;
-        console.log(`✓ Modo: perguntar antes de cada modificação\n`);
+        saveSettings({ sessionRejectAll: false });
+        console.log(`✓ Modo: perguntar antes de cada modificação (salvo em settings)\n`);
       } else {
         console.log("Uso: /reject [on|off]\n");
       }
@@ -1709,101 +1490,6 @@ async function main() {
         }
         console.log();
       }
-      continue;
-    }
-
-    // /start <nome> <comando> - inicia processo gerenciado
-    if (input.startsWith("/start ")) {
-      const rest = input.slice(7).trim();
-      // Suporte a --fg para foreground
-      const fg = rest.includes("--fg");
-      const cleanRest = rest.replace(/--fg/g, "").trim();
-      const parts = cleanRest.split(" ");
-      if (parts.length < 2) {
-        console.log("Uso: /start [--fg] <nome> <comando>");
-        continue;
-      }
-      const name = parts.shift()!;
-      const cmd = parts.join(" ");
-      const ok = (await ask(`Iniciar processo '${name}'${fg ? " (foreground)" : ""}: ${cmd} ? (y/n): `, true)).trim().toLowerCase();
-      if (ok !== "y" && ok !== "yes") {
-        console.log("Cancelado pelo usuário.\n");
-        continue;
-      }
-      if (fg) {
-        // Foreground: trava terminal, mostra stdout/stderr ao vivo
-        try {
-          await runCommand(cmd, process.cwd());
-          console.log(`✓ Processo '${name}' (foreground) finalizado.`);
-        } catch (e: any) {
-          console.error(`Erro ao rodar processo foreground: ${(e && e.message) || e}`);
-        }
-      } else {
-        console.log(startManagedProcess(name, cmd, process.cwd()));
-      }
-      continue;
-    }
-
-    // /stop [nome] - para processo gerenciado (sem nome = para ativo)
-    if (input === "/stop" || input.startsWith("/stop ")) {
-      const name = input.slice(5).trim();
-      const targetName = name || activeProcessName;
-      if (!targetName) {
-        console.log("[Nenhum processo ativo. Use /ps para listar.]\n");
-        continue;
-      }
-      const ok = (await ask(`Parar processo '${targetName}' ? (y/n): `, true)).trim().toLowerCase();
-      if (ok !== "y" && ok !== "yes") {
-        console.log("Cancelado pelo usuário.\n");
-        continue;
-      }
-      console.log(await stopManagedProcess(targetName));
-      if (targetName === activeProcessName) activeProcessName = null;
-      continue;
-    }
-
-    // /kill [nome] - alias para /stop (mata ativo se nenhum nome, sem confirmação)
-    if (input === "/kill" || input.startsWith("/kill ")) {
-      const name = input.slice(5).trim();
-      const targetName = name || activeProcessName;
-      if (!targetName) {
-        console.log("[Nenhum processo ativo. Use /ps para listar.]\n");
-        continue;
-      }
-      console.log(await stopManagedProcess(targetName));
-      if (targetName === activeProcessName) activeProcessName = null;
-      continue;
-    }
-
-    // /ps - lista processos gerenciados
-    if (input === "/ps") {
-      if (activeProcessName) {
-        console.log(`[Processo ativo: ${activeProcessName}]\n`);
-      }
-      console.log(listManaged() + "\n");
-      continue;
-    }
-
-    // /logs [nome] [linhas] - exibe logs de processo gerenciado
-    if (input === "/logs" || input.startsWith("/logs ")) {
-      const rest = input.slice(5).trim();
-      const parts = rest ? rest.split(/\s+/) : [];
-
-      let targetName: string | undefined;
-      let lineCount = 80;
-
-      if (parts.length === 1) {
-        const n = Number(parts[0]);
-        if (Number.isFinite(n)) lineCount = n;
-        else targetName = parts[0];
-      } else if (parts.length >= 2) {
-        targetName = parts[0];
-        const n = Number(parts[1]);
-        if (Number.isFinite(n)) lineCount = n;
-      }
-
-      const out = getManagedProcessLogs(targetName, lineCount);
-      console.log(out + "\n");
       continue;
     }
 
