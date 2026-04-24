@@ -86,23 +86,37 @@ const API_URL_DEFAULTS = {
   google: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
 };
 
-const MODEL_DEFAULT = "z-ai/glm-4.5-air:free";
-const FALLBACK_MODEL_DEFAULT = "openai/gpt-oss-120b:free";
-const DEFAULT_MODELS = ["openai/gpt-oss-120b:free", "z-ai/glm-4.5-air:free"];
+const MODEL_DEFAULT = "openai/gpt-oss-120b:free";
+const FALLBACK_MODEL_DEFAULT = "openai/gpt-oss-20b:free";
+const DEFAULT_MODELS = ["openai/gpt-oss-120b:free", "openai/gpt-oss-20b:free"];
 const ALLOWED_MODELS = [
-  "z-ai/glm-4.5-air:free",
-  "openai/gpt-oss-120b:free",
-  "openai/gpt-5.4-nano",
-  "openai/gpt-5.3-codex",
+  // anthropic
+  "anthropic/claude-3-haiku",
   "anthropic/claude-haiku-4.5",
   "anthropic/claude-sonnet-4.6",
   "anthropic/claude-opus-4.7",
+  // google
+  "google/gemini-2.5-flash-lite",
+  "google/gemini-2.5-flash",
+  "google/gemini-3.1-flash-lite-preview",
+  "google/gemini-3-flash-preview",
+  // minimax
+  "minimax/minimax-m2.5",
+  "minimax/minimax-m2.5:free",
+  "minimax/minimax-m2.7",
+  // moonshotai
+  "moonshotai/kimi-k2.6",
+  // openai
+  "openai/gpt-5.4-nano",
+  "openai/gpt-5.3-codex",
+  "openai/gpt-oss-20b:free",
+  "openai/gpt-oss-120b:free",
+  // qwen
   "qwen/qwen3.6-plus",
-  "gemini-2.0-flash",
-  "gemini-2.0-flash-lite-preview-02-05",
-  "gemini-1.5-flash",
-  "gemini-1.5-pro",
-  "gemini-1.5-flash-8b",
+  "qwen/qwen3.5-9b",
+  "qwen/qwen3-coder",
+  // z-ai
+  "z-ai/glm-4.5-air:free",
 ];
 const MAX_TOOL_ROUNDS = 20;
 const MAX_RETRIES = 2; // Número máximo de retries com fallback
