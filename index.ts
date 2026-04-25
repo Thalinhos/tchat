@@ -177,6 +177,7 @@ Antes de executar tarefas complexas:
 
 ## Ferramentas: <read_file>path</read_file>, <list_dir>path</list_dir>, <search_files>pattern</search_files>, <write_file path="p">content</write_file>
 Para comandos: <run_command>cmd</run_command> (sync)
+OBS: você pode usar essas ferramentas para ler, buscar, editar arquivos e executar comandos (sempre em foreground);
 REGRA: sempre execute comando em foreground no terminal visível. Nunca use background.
 Responda em português`;
 
@@ -584,6 +585,99 @@ async function searchFilesAsync(pattern: string): Promise<string> {
   stop();
   if (results.length === 0) return `[Nenhum arquivo encontrado para: "${pattern}"]`;
   return `[Arquivos encontrados para "${pattern}":]\n` + results.join("\n");
+}
+
+// Search file contents (case-insensitive)
+async function searchFilesByContentAsync(pattern: string): Promise<string> {
+  const cwd = process.cwd();
+  const lowerPattern = pattern.toLowerCase();
+  const results: string[] = [];
+  const stop = startSpinner(`Searching contents for ${pattern}...`);
+
+  async function walk(dir: string, depth: number) {
+    if (depth > 12 || results.length >= 200) return;
+    try {
+      const entries = await fsp.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= 200) break;
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full, depth + 1);
+        } else {
+          try {
+            const buf = await fsp.readFile(full);
+            // skip binary-looking files
+            if (buf.indexOf(0) !== -1) continue;
+            const text = buf.toString("utf8");
+            if (text.toLowerCase().includes(lowerPattern)) {
+              results.push(path.relative(cwd, full).replace(/\\/g, "/"));
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  await walk(cwd, 0);
+  stop();
+  if (results.length === 0) return `[Nenhum conteúdo encontrado para: "${pattern}"]`;
+  return `[Arquivos cujo conteúdo contém "${pattern}":]\n` + results.join("\n");
+}
+
+// Replace text in files (literal match). Prompts per-file via writeFile.
+async function replaceInFilesAsync(pattern: string, replacement: string): Promise<string> {
+  const cwd = process.cwd();
+  const files: string[] = [];
+
+  // find candidate files
+  async function walk(dir: string, depth: number) {
+    if (depth > 12) return;
+    try {
+      const entries = await fsp.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full, depth + 1);
+        } else {
+          try {
+            const buf = await fsp.readFile(full);
+            if (buf.indexOf(0) !== -1) continue;
+            const text = buf.toString("utf8");
+            if (text.includes(pattern)) files.push(full);
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  await walk(cwd, 0);
+  if (files.length === 0) return `[Nenhum arquivo com o texto "${pattern}" encontrado]`;
+
+  console.log(`\nEncontrados ${files.length} arquivo(s) contendo "${pattern}":`);
+  files.forEach((f) => console.log(`  - ${path.relative(cwd, f)}`));
+
+  const ok = (await ask('\nExecutar replace em todos esses arquivos? (y/N): ', true)).trim().toLowerCase();
+  if (ok !== 'y' && ok !== 'yes') return '[Operação cancelada pelo usuário]';
+
+  const outResults: string[] = [];
+  for (const full of files) {
+    try {
+      const old = await fsp.readFile(full, 'utf8');
+      const newContent = old.split(pattern).join(replacement);
+      if (newContent === old) {
+        outResults.push(`[nochange] ${path.relative(cwd, full)}`);
+        continue;
+      }
+      const res = await writeFile(path.relative(cwd, full), newContent);
+      outResults.push(res);
+    } catch (e: any) {
+      outResults.push(`[erro] ${path.relative(cwd, full)}: ${e.message}`);
+    }
+  }
+
+  return outResults.join('\n');
 }
 
 // --- Parse tool calls from AI response ---
@@ -1563,6 +1657,34 @@ async function main() {
         }
         console.log();
       }
+      continue;
+    }
+
+    // /search command: search file contents
+    if (input.startsWith("/search ")) {
+      const q = input.slice(8).trim();
+      if (!q) {
+        console.log("Uso: /search <texto>");
+        continue;
+      }
+      const out = await searchFilesByContentAsync(q);
+      console.log(out + "\n");
+      continue;
+    }
+
+    // /replace command: replace literal text across files
+    // Usage: /replace <texto_antigo> -> <novo_texto>
+    if (input.startsWith("/replace ")) {
+      const rest = input.slice(9).trim();
+      const parts = rest.split(/\s+->\s+/);
+      if (parts.length !== 2) {
+        console.log("Uso: /replace <texto_antigo> -> <novo_texto>");
+        continue;
+      }
+      const oldText = parts[0];
+      const newText = parts[1];
+      const res = await replaceInFilesAsync(oldText, newText);
+      console.log(res + "\n");
       continue;
     }
 
