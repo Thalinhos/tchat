@@ -102,7 +102,6 @@ const ALLOWED_MODELS = [
   "google/gemini-3-flash-preview",
   // minimax
   "minimax/minimax-m2.5",
-  "minimax/minimax-m2.5:free",
   "minimax/minimax-m2.7",
   // moonshotai
   "moonshotai/kimi-k2.6",
